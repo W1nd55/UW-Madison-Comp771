@@ -46,7 +46,7 @@ class CustomConv2DFunction(Function):
         assert isinstance(stride, int) and (stride > 0)
         assert isinstance(padding, int) and (padding >= 0)
 
-        # save the conv params
+        # save the conv params for the backward pass
         kernel_size = weight.size(2)
         ctx.stride = stride
         ctx.padding = padding
@@ -60,9 +60,38 @@ class CustomConv2DFunction(Function):
         ########################################################################
         # Fill in the code here
         ########################################################################
+        
+        # 1. Get input and weight dimensions
+        N, C_i, H_i, W_i = input_feats.shape
+        C_o, _, K, _ = weight.shape
 
-        # save for backward (you need to save the unfolded tensor into ctx)
-        # ctx.save_for_backward(your_vars, weight, bias)
+        # 2. Calculate the output feature map dimensions
+        H_o = (H_i + 2 * padding - K) // stride + 1
+        W_o = (W_i + 2 * padding - K) // stride + 1
+
+        # 3. Use unfold (im2col) to extract sliding windows as columns
+        unfolded_input = unfold(
+            input_feats,
+            kernel_size=(K, K),
+            padding=padding,
+            stride=stride
+        )
+
+        # 4. Reshape the weight into a matrix for multiplication
+        reshaped_weight = weight.view(C_o, -1)
+
+        # 5. Perform the core matrix multiplication
+        output = reshaped_weight @ unfolded_input
+
+        # 6. Add the bias term if it exists
+        if bias is not None:
+            output += bias.view(1, -1, 1)
+
+        # 7. Reshape the output back to the standard image format
+        output = output.view(N, C_o, H_o, W_o)
+
+        # Save the unfolded input and weight for the backward pass
+        ctx.save_for_backward(unfolded_input, weight, bias)
 
         return output
 
@@ -80,29 +109,52 @@ class CustomConv2DFunction(Function):
           grad_bias: gradients of the bias term
 
         """
-        # unpack tensors and initialize the grads
-        # your_vars, weight, bias = ctx.saved_tensors
+        # 1. Unpack saved tensors from the forward pass
+        unfolded_input, weight, bias = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
-        # recover the conv params
-        kernel_size = weight.size(2)
+        # 2. Recover convolution parameters saved in ctx
         stride = ctx.stride
         padding = ctx.padding
         input_height = ctx.input_height
         input_width = ctx.input_width
+        
+        # Get dimensions from weight and grad_output
+        kernel_size = weight.size(2)
+        N, C_o, H_o, W_o = grad_output.shape
+        _, C_i, K, _ = weight.shape
+        L = H_o * W_o
 
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
-        # compute the gradients w.r.t. input and params
+        # 3. Reshape grad_output for matrix multiplication
+        reshaped_grad_output = grad_output.view(N, C_o, L)
 
+        # 4. Compute the gradient with respect to the weights (grad_weight)
+        if ctx.needs_input_grad[1]:
+            grad_weight_reshaped = reshaped_grad_output @ unfolded_input.transpose(1, 2)
+            grad_weight = grad_weight_reshaped.sum(dim=0)
+            grad_weight = grad_weight.view(weight.shape)
+
+        # 5. Compute the gradient with respect to the input (grad_input)
+        if ctx.needs_input_grad[0]:
+            reshaped_weight_t = weight.view(C_o, -1).t()
+            grad_unfolded = reshaped_weight_t @ reshaped_grad_output
+            grad_input = fold(
+                grad_unfolded,
+                output_size=(input_height, input_width),
+                kernel_size=(K, K),
+                padding=padding,
+                stride=stride,
+            )
+
+        # 6. Compute the gradient with respect to the bias (grad_bias)
         if bias is not None and ctx.needs_input_grad[2]:
-            # compute the gradients w.r.t. bias (if any)
             grad_bias = grad_output.sum((0, 2, 3))
+        
+        # 7. (FIXED) Clone grad_input only if it's not None
+        grad_input_clone = grad_input.clone() if grad_input is not None else None
 
-        return grad_input, grad_weight, grad_bias, None, None
-
-
+        return grad_input_clone, grad_weight, grad_bias, None, None
+      
 custom_conv2d = CustomConv2DFunction.apply
 
 
