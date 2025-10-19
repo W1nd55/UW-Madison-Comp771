@@ -154,7 +154,8 @@ class CustomConv2DFunction(Function):
         grad_input_clone = grad_input.clone() if grad_input is not None else None
 
         return grad_input_clone, grad_weight, grad_bias, None, None
-      
+
+
 custom_conv2d = CustomConv2DFunction.apply
 
 
@@ -225,32 +226,49 @@ class CustomConv2d(Module):
 ################################################################################
 # Part I.2: Design and train a convolutional network
 ################################################################################
-class SimpleNet(nn.Module):
-    # a simple CNN for image classifcation
+
+class MyBetterNet(nn.Module):
+    # add Batch Normalization
     def __init__(self, conv_op=nn.Conv2d, num_classes=100):
-        super(SimpleNet, self).__init__()
-        # you can start from here and create a better model
+        super(MyBetterNet, self).__init__()
+        
+        
         self.features = nn.Sequential(
             # conv1 block: conv 7x7
             conv_op(3, 64, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(64), 
             nn.ReLU(inplace=True),
+            
             # max pooling 1/2
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            # conv2 block: simple bottleneck
+            
+            # conv2 block: bottleneck with BatchNorm
             conv_op(64, 64, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(64), 
             nn.ReLU(inplace=True),
+            
             conv_op(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64), 
             nn.ReLU(inplace=True),
+            
             conv_op(64, 256, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(256), 
             nn.ReLU(inplace=True),
+            
             # max pooling 1/2
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            # conv3 block: simple bottleneck
+            
+            # conv3 block: bottleneck with BatchNorm
             conv_op(256, 128, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
+            
             conv_op(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128), 
             nn.ReLU(inplace=True),
+            
             conv_op(128, 512, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(512), 
             nn.ReLU(inplace=True),
         )
         # global avg pooling + FC
@@ -265,23 +283,21 @@ class SimpleNet(nn.Module):
                     m.weight, mode="fan_out", nonlinearity="relu"
                 )
                 if m.bias is not None:
-                    nn.init.consintat_(m.bias, 0.0)
+                    nn.init.constant_(m.bias, 0.0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x):
-        # you can implement adversarial training here
-        # if self.training:
-        #   # generate adversarial sample based on x
         x = self.features(x)
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
         return x
 
+
+default_cnn_model = MyBetterNet
 # change this to your model!
-default_cnn_model = SimpleNet
 
 ################################################################################
 # Part II.1: Understanding self-attention and Transformer block
