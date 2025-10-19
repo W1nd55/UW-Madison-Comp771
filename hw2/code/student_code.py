@@ -11,7 +11,7 @@ from utils import resize_image
 import custom_transforms as transforms
 from custom_blocks import (PatchEmbed, window_partition, window_unpartition,
                            DropPath, MLP, trunc_normal_)
-
+import torch.nn.functional as F
 
 ################################################################################
 # You will need to fill in the missing code in this file
@@ -275,6 +275,81 @@ class SimpleNet(nn.Module):
 
 # change this to your model!
 default_cnn_model = SimpleNet
+
+
+def conv3x3(conv_op, in_ch, out_ch, stride=1):
+    return conv_op(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, conv_op, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv1 = conv3x3(conv_op, in_ch, out_ch, stride)
+        self.bn1   = nn.BatchNorm2d(out_ch)
+        self.relu  = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(conv_op, out_ch, out_ch, 1)
+        self.bn2   = nn.BatchNorm2d(out_ch)
+
+        self.downsample = None
+        if stride != 1 or in_ch != out_ch:
+            self.downsample = nn.Sequential(
+                conv_op(in_ch, out_ch, kernel_size=1, stride=stride, padding=0, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out = self.relu(out + identity)
+        return out
+
+class BetterNet(nn.Module):
+    def __init__(self, conv_op=nn.Conv2d, num_classes=100, dropout_p=0.2):
+        super().__init__()
+        self.conv1 = conv3x3(conv_op, 3, 64, stride=1)
+        self.bn1   = nn.BatchNorm2d(64)
+        self.relu  = nn.ReLU(inplace=True)
+
+        self.layer1 = self._make_layer(conv_op, 64,  64,  blocks=2, stride=1)  # 32x32
+        self.layer2 = self._make_layer(conv_op, 64,  128, blocks=2, stride=2)  # 16x16
+        self.layer3 = self._make_layer(conv_op, 128, 256, blocks=2, stride=2)  # 8x8
+        self.layer4 = self._make_layer(conv_op, 256, 512, blocks=2, stride=2)  # 4x4
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(p=dropout_p)
+        self.fc = nn.Linear(512, num_classes)
+
+        self._init_weights()
+
+    def _make_layer(self, conv_op, in_ch, out_ch, blocks, stride):
+        layers = [BasicBlock(conv_op, in_ch, out_ch, stride)]
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(conv_op, out_ch, out_ch, 1))
+        return nn.Sequential(*layers)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.layer1(x); x = self.layer2(x); x = self.layer3(x); x = self.layer4(x)
+        x = self.avgpool(x).flatten(1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+    
+better_cnn_model = BetterNet
 
 ################################################################################
 # Part II.1: Understanding self-attention and Transformer block
@@ -651,3 +726,82 @@ def vis_grid(input, n_rows=10):
     return output_imgs
 
 default_visfunction = vis_grid
+
+
+class AdvSimpleNet(nn.Module):
+    """
+    与 SimpleNet 同结构，但 forward 内部会：
+      1) 将归一化后的输入反归一化到像素空间 [0,1]
+      2) 使用传入的 PGDAttack 生成对抗样本（像素空间）
+      3) 再归一化回网络输入空间并完成前向
+    说明：
+      - 需要在构造时传入 attack（即你的 PGDAttack 实例）
+      - 假设训练/数据增强使用的是 ImageNet mean/std
+      - crafting 时临时切到 eval() 以避免 BN 统计被污染，之后恢复 train()
+    """
+    def __init__(self, attack, conv_op=nn.Conv2d, num_classes=100):
+        super().__init__()
+        assert attack is not None, "Must provide a PGDAttack instance"
+        self.attack = attack
+
+        self.features = nn.Sequential(
+            conv_op(3, 64, kernel_size=7, stride=2, padding=3),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            conv_op(64, 64, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(inplace=True),
+            conv_op(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            conv_op(64, 256, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            conv_op(256, 128, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(inplace=True),
+            conv_op(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            conv_op(128, 512, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(inplace=True),
+        )
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, num_classes)
+        # mean / std from imagenet
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
+        self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
+
+    # 提取公共前向实现（不做对抗生成，避免递归）
+    def _forward_impl(self, x_norm):
+        x = self.features(x_norm)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+    def forward(self, x_norm):
+        """
+        x_norm: 归一化后的输入（与数据增强一致）
+        返回：在 PGD 对抗样本上计算得到的 logits
+        """
+        if not self.training:
+            return self._forward_impl(x_norm)
+        # 1) 反归一化到像素空间 [0,1]
+        x_pixel = (x_norm * self.std + self.mean).clamp(0.0, 1.0)
+
+        # 2) 构造一个“适配器”给 PGDAttack：接受像素 -> 归一化 -> 走 _forward_impl
+        def model_adapter(inp_pixel):
+            # inp_pixel 为 [0,1]，转回 normalized 再前向
+            inp_norm = (inp_pixel - self.mean) / self.std
+            return self._forward_impl(inp_norm)
+
+        # 3) crafting：为避免 BN 统计污染，临时 eval，再恢复原状态
+        was_training = self.training
+        self.eval()
+        x_adv_pixel = self.attack.perturb(model_adapter, x_pixel)  # 像素空间 PGD
+        if was_training:
+            self.train()
+
+        # 4) 再次归一化并完成真正前向
+        x_adv_norm = (x_adv_pixel - self.mean) / self.std
+        logits = self._forward_impl(x_adv_norm)
+        return logits
+
+default_ad_conv_model = AdvSimpleNet

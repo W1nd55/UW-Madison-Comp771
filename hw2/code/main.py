@@ -37,6 +37,8 @@ from student_code import (
     default_vit_model,
     get_train_transforms,
     get_val_transforms,
+    default_ad_conv_model,
+    better_cnn_model
 )
 
 # part III
@@ -157,6 +159,12 @@ parser.add_argument(
 parser.add_argument(
     "--use-resnet18", action="store_true", help="Use pretrained resnet18 model"
 )
+parser.add_argument(
+    "--use-ad-conv", action="store_true", help="Use custom adversarial convolution"
+)
+parser.add_argument(
+        "--use-better-cnn", action="store_true", help="Use better CNN model"
+)
 parser.add_argument("--gpu", default=0, type=int, help="GPU ID to use.")
 
 
@@ -192,6 +200,20 @@ def main(args):
     elif args.use_vit:
         model = default_vit_model(num_classes=100)
         model_arch = "ViT"
+    elif args.use_ad_conv:
+        print("Using custom adversarial convolutions in the network")
+        attack = default_attack(
+            loss_fn=nn.CrossEntropyLoss(),
+            num_steps=4,
+            step_size=2.0/255.0,
+            epsilon=8.0/255.0
+        )
+        model = default_ad_conv_model(attack=attack, conv_op=nn.Conv2d, num_classes=100)
+        model_arch = "CNN" 
+    elif args.use_better_cnn:
+        print("Using better CNN model")
+        model = better_cnn_model(conv_op=nn.Conv2d, num_classes=100)
+        model_arch = "Better_CNN"
     else:
         model = default_cnn_model(num_classes=100)
         model_arch = "CNN"
