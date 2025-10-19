@@ -60,9 +60,29 @@ class CustomConv2DFunction(Function):
         ########################################################################
         # Fill in the code here
         ########################################################################
+        N, _, H, W = input_feats.shape
+        C_out, C_in, K, _ = weight.shape
+        x_unf = unfold(
+            input_feats,
+            kernel_size=kernel_size,
+            padding=padding,
+            stride=stride,
+        )  # (N, C_in*K*K, L)
+
+        H_out = (ctx.input_height + 2 * padding - kernel_size) // stride + 1
+        W_out = (ctx.input_width  + 2 * padding - kernel_size) // stride + 1
+        w_flat = weight.view(C_out, -1)
+        out_cols = torch.bmm(w_flat.unsqueeze(0).expand(N, -1, -1), x_unf)
+        if bias is not None:
+            out_cols = out_cols + bias.view(1, -1, 1)
+            
+        output = out_cols.view(N, C_out, H_out, W_out).clone()
 
         # save for backward (you need to save the unfolded tensor into ctx)
-        # ctx.save_for_backward(your_vars, weight, bias)
+        bias_to_save = bias if bias is not None else torch.zeros(
+            C_out, device=weight.device, dtype=weight.dtype
+        )
+        ctx.save_for_backward(x_unf, weight, bias_to_save)
 
         return output
 
@@ -80,8 +100,8 @@ class CustomConv2DFunction(Function):
           grad_bias: gradients of the bias term
 
         """
-        # unpack tensors and initialize the grads
-        # your_vars, weight, bias = ctx.saved_tensors
+        # compute the gradients w.r.t. input and params
+        x_unf, weight, bias = ctx.saved_tensors  # x_unf: (N, C_in*K*K, L)
         grad_input = grad_weight = grad_bias = None
 
         # recover the conv params
@@ -94,7 +114,32 @@ class CustomConv2DFunction(Function):
         ########################################################################
         # Fill in the code here
         ########################################################################
-        # compute the gradients w.r.t. input and params
+        
+        N, C_out, H_out, W_out = grad_output.shape
+        L = H_out * W_out
+
+        # (N, C_out, L)
+        grad_out_cols = grad_output.reshape(N, C_out, L)
+
+        # grad_weight
+        if ctx.needs_input_grad[1]:
+            # (N, C_out, L) @ (N, L, C_in*K*K) -> (N, C_out, C_in*K*K) 
+            grad_w_flat = torch.bmm(grad_out_cols, x_unf.transpose(1, 2)).sum(dim=0)
+            grad_weight = grad_w_flat.view_as(weight)
+
+        # grad_input
+        if ctx.needs_input_grad[0]:
+            # w_flat^T: (C_in*K*K, C_out)
+            w_flat_t = weight.view(C_out, -1).t().unsqueeze(0).expand(N, -1, -1)
+            # (N, C_in*K*K, C_out) @ (N, C_out, L) -> (N, C_in*K*K, L)
+            grad_x_unf = torch.bmm(w_flat_t, grad_out_cols)
+            grad_input = fold(
+                grad_x_unf,
+                output_size=(input_height, input_width),
+                kernel_size=kernel_size,
+                padding=padding,
+                stride=stride,
+            )
 
         if bias is not None and ctx.needs_input_grad[2]:
             # compute the gradients w.r.t. bias (if any)
@@ -213,7 +258,7 @@ class SimpleNet(nn.Module):
                     m.weight, mode="fan_out", nonlinearity="relu"
                 )
                 if m.bias is not None:
-                    nn.init.consintat_(m.bias, 0.0)
+                    nn.init.constant_(m.bias, 0.0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
@@ -330,8 +375,19 @@ class TransformerBlock(nn.Module):
         # (also known as window attention)
 
         # MLP after MSA, both can be dropped at random
-        # x = shortcut + self.drop_path(x)
-        # x = x + self.drop_path(self.mlp(self.norm2(x)))
+        
+        if self.window_size and self.window_size > 0:
+            # 局部窗口注意力
+            x_windows, pad_hw = window_partition(x, self.window_size)   # (B*nW, w, w, C)
+            x_windows = self.attn(x_windows)                            # 同形状 (B*nW, w, w, C)
+            x = window_unpartition(x_windows, self.window_size, pad_hw) # 还原到 (B, H, W, C)
+        else:
+            # 全局注意力
+            x = self.attn(x)
+
+        # 残差 + MLP
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -415,6 +471,22 @@ class SimpleViT(nn.Module):
         # Fill in the code here
         ########################################################################
         # The implementation shall define some Transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop_path=dpr[i],
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                window_size=(window_size if (i in window_block_indexes) else 0),
+            )
+            for i in range(depth)
+        ])
+
+        self.norm = norm_layer(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
 
         if self.pos_embed is not None:
             trunc_normal_(self.pos_embed, std=0.02)
@@ -435,6 +507,20 @@ class SimpleViT(nn.Module):
         ########################################################################
         # Fill in the code here
         ########################################################################
+        # Patch embedding: (B, C_in, H, W) -> (B, H', W', C)
+        x = self.patch_embed(x)
+
+        if self.pos_embed is not None:
+            # pos_embed: (1, H', W', C)
+            x = x + self.pos_embed
+
+        # Transformer blocks
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        x = x.mean(dim=(1, 2))
+        x = self.head(x)
         return x
 
 # change this to your model!
@@ -510,11 +596,39 @@ class PGDAttack(object):
         output = input.clone()
         input.requires_grad = False
 
-        # loop over the number of steps
-        # for _ in range(self.num_steps):
         ########################################################################
         # Fill in the code here
         ########################################################################
+        # loop over the number of steps
+        for _ in range(self.num_steps):
+            # enable gradient w.r.t. the adversarial input
+            output.requires_grad_()
+            logits = model(output)
+
+            # choose least confident label as the target (per-sample)
+            with torch.no_grad():
+                probs = F.softmax(logits, dim=1)
+                target = probs.argmin(dim=1)
+
+            # compute loss w.r.t. the chosen (incorrect) target
+            loss = self.loss_fn(logits, target)
+
+            # compute gradient of loss w.r.t. the input
+            grad = torch.autograd.grad(loss, output, retain_graph=False, create_graph=False)[0]
+
+            # update the adversarial example (minimize loss for the chosen incorrect label)
+            with torch.no_grad():
+                output = output - self.step_size * torch.sign(grad)
+
+                # project back to the l_inf epsilon-ball around the original input
+                output = torch.max(torch.min(output, input + self.epsilon), input - self.epsilon)
+
+                # ensure valid pixel range
+                output = torch.clamp(output, 0.0, 1.0)
+
+            # detach to avoid building up the graph
+            output = output.detach()
+            
 
         return output
 
