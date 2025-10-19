@@ -719,41 +719,40 @@ class PGDAttack(object):
         output = input.clone()
         input.requires_grad = False
 
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
         # loop over the number of steps
         for _ in range(self.num_steps):
-            # enable gradient w.r.t. the adversarial input
-            output.requires_grad_()
+        ########################################################################
+            # start by enabling grad for the current adv example
+            output.requires_grad = True
+
+            # forward pass
             logits = model(output)
 
-            # choose least confident label as the target (per-sample)
-            with torch.no_grad():
-                probs = F.softmax(logits, dim=1)
-                target = probs.argmin(dim=1)
+            # determine least-likely (target) label once at the first step
+            if _ == 0:
+                probs0 = torch.softmax(logits.detach(), dim=1)
+                target_labels = torch.argmin(probs0, dim=1).to(output.device)
 
-            # compute loss w.r.t. the chosen (incorrect) target
-            loss = self.loss_fn(logits, target)
+            # compute targeted loss (minimize loss towards the least-likely label)
+            loss = self.loss_fn(logits, target_labels)
 
-            # compute gradient of loss w.r.t. the input
+            # compute gradient w.r.t. the adversarial input
             grad = torch.autograd.grad(loss, output, retain_graph=False, create_graph=False)[0]
 
-            # update the adversarial example (minimize loss for the chosen incorrect label)
-            with torch.no_grad():
-                output = output - self.step_size * torch.sign(grad)
+            # take a step to minimize the loss toward the target (targeted attack)
+            output = output - self.step_size * torch.sign(grad)
 
-                # project back to the l_inf epsilon-ball around the original input
-                output = torch.max(torch.min(output, input + self.epsilon), input - self.epsilon)
+            # project back to the l_inf ball around the original input
+            delta = output - input
+            delta = torch.clamp(delta, min=-self.epsilon, max=self.epsilon)
+            output = (input + delta).detach()
 
-                # ensure valid pixel range
-                output = torch.clamp(output, 0.0, 1.0)
-
-            # detach to avoid building up the graph
-            output = output.detach()
-            
+            # disable grad for next iteration
+            output.requires_grad = False
+        ########################################################################
 
         return output
+
 
 default_attack = PGDAttack
 
