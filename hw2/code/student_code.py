@@ -511,9 +511,35 @@ class PGDAttack(object):
         input.requires_grad = False
 
         # loop over the number of steps
-        # for _ in range(self.num_steps):
+        for _ in range(self.num_steps):
         ########################################################################
-        # Fill in the code here
+            # start by enabling grad for the current adv example
+            output.requires_grad = True
+
+            # forward pass
+            logits = model(output)
+
+            # determine least-likely (target) label once at the first step
+            if _ == 0:
+                probs0 = torch.softmax(logits.detach(), dim=1)
+                target_labels = torch.argmin(probs0, dim=1).to(output.device)
+
+            # compute targeted loss (minimize loss towards the least-likely label)
+            loss = self.loss_fn(logits, target_labels)
+
+            # compute gradient w.r.t. the adversarial input
+            grad = torch.autograd.grad(loss, output, retain_graph=False, create_graph=False)[0]
+
+            # take a step to minimize the loss toward the target (targeted attack)
+            output = output - self.step_size * torch.sign(grad)
+
+            # project back to the l_inf ball around the original input
+            delta = output - input
+            delta = torch.clamp(delta, min=-self.epsilon, max=self.epsilon)
+            output = (input + delta).detach()
+
+            # disable grad for next iteration
+            output.requires_grad = False
         ########################################################################
 
         return output
