@@ -351,6 +351,53 @@ class BetterNet(nn.Module):
     
 better_cnn_model = BetterNet
 
+class BetterSimpleNet(nn.Module):
+    def __init__(self, conv_op=nn.Conv2d, num_classes=100):
+        super().__init__()
+        # block1: 7×7 stem
+        self.conv1 = conv_op(3, 64, 7, stride=2, padding=3, bias=False)
+        self.bn1   = nn.BatchNorm2d(64)
+        self.relu  = nn.ReLU(inplace=True)
+        self.pool1 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        # block2
+        self.conv2a = conv_op(64, 64, 3, padding=1, bias=False)
+        self.bn2a   = nn.BatchNorm2d(64)
+        self.conv2b = conv_op(64, 64, 3, padding=1, bias=False)
+        self.bn2b   = nn.BatchNorm2d(64)
+
+        # block3
+        self.conv3a = conv_op(64, 128, 3, stride=2, padding=1, bias=False)
+        self.bn3a   = nn.BatchNorm2d(128)
+        self.conv3b = conv_op(128, 128, 3, padding=1, bias=False)
+        self.bn3b   = nn.BatchNorm2d(128)
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.pool1(x)
+
+        # residual block2
+        identity = x
+        out = self.relu(self.bn2a(self.conv2a(x)))
+        out = self.bn2b(self.conv2b(out))
+        out += identity
+        x = self.relu(out)
+
+        # residual block3
+        identity = self.bn3a(self.conv3a(x))
+        out = self.relu(identity)
+        out = self.bn3b(self.conv3b(out))
+        x = self.relu(out + identity)
+
+        x = self.avgpool(x).flatten(1)
+        x = self.fc(x)
+        return x
+
+better_simple_cnn_model = BetterSimpleNet
+
 ################################################################################
 # Part II.1: Understanding self-attention and Transformer block
 ################################################################################
@@ -395,6 +442,7 @@ class Attention(nn.Module):
         # Fill in the code here
         ########################################################################
         return x
+
 
 class TransformerBlock(nn.Module):
     """Transformer blocks with support of local window self-attention"""

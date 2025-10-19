@@ -38,7 +38,8 @@ from student_code import (
     get_train_transforms,
     get_val_transforms,
     default_ad_conv_model,
-    better_cnn_model
+    better_cnn_model,
+    better_simple_cnn_model
 )
 
 # part III
@@ -165,6 +166,9 @@ parser.add_argument(
 parser.add_argument(
         "--use-better-cnn", action="store_true", help="Use better CNN model"
 )
+parser.add_argument(
+        "--use-better-simple-cnn", action="store_true", help="Use better simple CNN model"
+)
 parser.add_argument("--gpu", default=0, type=int, help="GPU ID to use.")
 
 
@@ -214,6 +218,10 @@ def main(args):
         print("Using better CNN model")
         model = better_cnn_model(conv_op=nn.Conv2d, num_classes=100)
         model_arch = "Better_CNN"
+    elif args.use_better_simple_cnn:
+        print("Using better simple CNN model")
+        model = better_simple_cnn_model(num_classes=100)
+        model_arch = "Better_Simple_CNN"
     else:
         model = default_cnn_model(num_classes=100)
         model_arch = "CNN"
