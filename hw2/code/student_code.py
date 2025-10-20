@@ -577,20 +577,14 @@ class TransformerBlock(nn.Module):
     def forward(self, x):
         shortcut = x
         x = self.norm1(x)
-
-        # The implementation shall support local self-attention
-        # (also known as window attention)
-
-        # MLP after MSA, both can be dropped at random
-        
         if self.window_size and self.window_size > 0:
+            H, W = x.shape[1], x.shape[2]      # x: (B, H, W, C)
             x_windows, pad_hw = window_partition(x, self.window_size)   # (B*nW, w, w, C)
-            x_windows = self.attn(x_windows)                            # (B*nW, w, w, C)
-            x = window_unpartition(x_windows, self.window_size, pad_hw) # (B, H, W, C)
+            x_windows = self.attn(x_windows)
+            x = window_unpartition(x_windows, self.window_size, pad_hw, (H, W))
         else:
             x = self.attn(x)
 
-        # Residual + MLP
         x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
