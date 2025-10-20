@@ -271,9 +271,18 @@ class Attention(nn.Module):
         )
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
+        # compute attention scores
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B*heads, H*W, H*W)
+        attn = attn.softmax(dim=-1)
+
+        x = attn @ v
+        x = x.reshape(B, self.num_heads, H * W, -1) # (B, heads, H*W, head_dim)
+        x = x.transpose(1, 2).reshape(B, H * W, -1) # (B, H*W, C)
+
+        # final projection
+        x = self.proj(x) # (B, H*W, C)
+        x = x.reshape(B, H, W, -1) # (B, H, W, C)
+        
         return x
 
 class TransformerBlock(nn.Module):
@@ -329,9 +338,20 @@ class TransformerBlock(nn.Module):
         # The implementation shall support local self-attention
         # (also known as window attention)
 
+        if self.window_size > 0:
+            # Local window self-attention
+            windows, (Hp, Wp) = window_partition(x, self.window_size)
+            attn_windows = self.attn(windows)
+            
+            # Merge windows back
+            x = window_unpartition(attn_windows, self.window_size, (Hp, Wp), (x.shape[1], x.shape[2]))
+        else:
+            # Global self-attention
+            x = self.attn(x)
+
         # MLP after MSA, both can be dropped at random
-        # x = shortcut + self.drop_path(x)
-        # x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
