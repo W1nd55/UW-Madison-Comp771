@@ -774,17 +774,18 @@ def vis_grid(input, n_rows=10):
 
 default_visfunction = vis_grid
 
-
 class AdvSimpleNet(nn.Module):
     """
-    与 SimpleNet 同结构，但 forward 内部会：
-      1) 将归一化后的输入反归一化到像素空间 [0,1]
-      2) 使用传入的 PGDAttack 生成对抗样本（像素空间）
-      3) 再归一化回网络输入空间并完成前向
-    说明：
-      - 需要在构造时传入 attack（即你的 PGDAttack 实例）
-      - 假设训练/数据增强使用的是 ImageNet mean/std
-      - crafting 时临时切到 eval() 以避免 BN 统计被污染，之后恢复 train()
+    Same architecture as SimpleNet, but the forward pass includes:
+      1) De-normalizing the input back to pixel space [0,1]
+      2) Generating adversarial samples in pixel space using the provided PGDAttack
+      3) Re-normalizing the adversarial samples and completing the forward pass
+
+    Notes:
+      - Requires an 'attack' argument (an instance of your PGDAttack)
+      - Assumes ImageNet mean/std normalization is used during training and data augmentation
+      - Temporarily switches to eval() mode during adversarial crafting to avoid BN statistics contamination,
+        then restores training mode afterwards
     """
     def __init__(self, attack, conv_op=nn.Conv2d, num_classes=100):
         super().__init__()
@@ -811,11 +812,12 @@ class AdvSimpleNet(nn.Module):
         )
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512, num_classes)
-        # mean / std from imagenet
+
+        # mean / std from ImageNet for normalization
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
         self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
 
-    # 提取公共前向实现（不做对抗生成，避免递归）
+    # Shared forward implementation (no adversarial generation to avoid recursion)
     def _forward_impl(self, x_norm):
         x = self.features(x_norm)
         x = self.avgpool(x)
@@ -825,30 +827,32 @@ class AdvSimpleNet(nn.Module):
 
     def forward(self, x_norm):
         """
-        x_norm: 归一化后的输入（与数据增强一致）
-        返回：在 PGD 对抗样本上计算得到的 logits
+        x_norm: normalized input (same normalization as data augmentation)
+        Returns: logits computed on PGD-generated adversarial samples
         """
         if not self.training:
             return self._forward_impl(x_norm)
-        # 1) 反归一化到像素空间 [0,1]
+
+        # 1) De-normalize input to pixel space [0,1]
         x_pixel = (x_norm * self.std + self.mean).clamp(0.0, 1.0)
 
-        # 2) 构造一个“适配器”给 PGDAttack：接受像素 -> 归一化 -> 走 _forward_impl
+        # 2) Construct a model adapter for PGDAttack: pixel -> normalized -> _forward_impl
         def model_adapter(inp_pixel):
-            # inp_pixel 为 [0,1]，转回 normalized 再前向
+            # inp_pixel is in [0,1], re-normalize it and run the shared forward
             inp_norm = (inp_pixel - self.mean) / self.std
             return self._forward_impl(inp_norm)
 
-        # 3) crafting：为避免 BN 统计污染，临时 eval，再恢复原状态
+        # 3) Adversarial crafting: temporarily switch to eval() to avoid BN stat pollution
         was_training = self.training
         self.eval()
-        x_adv_pixel = self.attack.perturb(model_adapter, x_pixel)  # 像素空间 PGD
+        x_adv_pixel = self.attack.perturb(model_adapter, x_pixel)  # pixel-space PGD
         if was_training:
             self.train()
 
-        # 4) 再次归一化并完成真正前向
+        # 4) Re-normalize the adversarial sample and complete the actual forward
         x_adv_norm = (x_adv_pixel - self.mean) / self.std
         logits = self._forward_impl(x_adv_norm)
         return logits
 
 default_ad_conv_model = AdvSimpleNet
+
