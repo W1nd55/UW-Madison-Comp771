@@ -46,7 +46,7 @@ class CustomConv2DFunction(Function):
         assert isinstance(stride, int) and (stride > 0)
         assert isinstance(padding, int) and (padding >= 0)
 
-        # save the conv params
+        # save the conv params for the backward pass
         kernel_size = weight.size(2)
         ctx.stride = stride
         ctx.padding = padding
@@ -56,33 +56,38 @@ class CustomConv2DFunction(Function):
         # make sure this is a valid convolution
         assert kernel_size <= (input_feats.size(2) + 2 * padding)
         assert kernel_size <= (input_feats.size(3) + 2 * padding)
+        
+        # 1. Get input and weight dimensions
+        N, C_i, H_i, W_i = input_feats.shape
+        C_o, _, K, _ = weight.shape
 
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
-        N, _, H, W = input_feats.shape
-        C_out, C_in, K, _ = weight.shape
-        x_unf = unfold(
+        # 2. Calculate the output feature map dimensions
+        H_o = (H_i + 2 * padding - K) // stride + 1
+        W_o = (W_i + 2 * padding - K) // stride + 1
+
+        # 3. Use unfold (im2col) to extract sliding windows as columns
+        unfolded_input = unfold(
             input_feats,
-            kernel_size=kernel_size,
+            kernel_size=(K, K),
             padding=padding,
-            stride=stride,
-        )  # (N, C_in*K*K, L)
-
-        H_out = (ctx.input_height + 2 * padding - kernel_size) // stride + 1
-        W_out = (ctx.input_width  + 2 * padding - kernel_size) // stride + 1
-        w_flat = weight.view(C_out, -1)
-        out_cols = torch.bmm(w_flat.unsqueeze(0).expand(N, -1, -1), x_unf)
-        if bias is not None:
-            out_cols = out_cols + bias.view(1, -1, 1)
-            
-        output = out_cols.view(N, C_out, H_out, W_out).clone()
-
-        # save for backward (you need to save the unfolded tensor into ctx)
-        bias_to_save = bias if bias is not None else torch.zeros(
-            C_out, device=weight.device, dtype=weight.dtype
+            stride=stride
         )
-        ctx.save_for_backward(x_unf, weight, bias_to_save)
+
+        # 4. Reshape the weight into a matrix for multiplication
+        reshaped_weight = weight.view(C_o, -1)
+
+        # 5. Perform the core matrix multiplication
+        output = reshaped_weight @ unfolded_input
+
+        # 6. Add the bias term if it exists
+        if bias is not None:
+            output += bias.view(1, -1, 1)
+
+        # 7. Reshape the output back to the standard image format
+        output = output.view(N, C_o, H_o, W_o)
+
+        # Save the unfolded input and weight for the backward pass
+        ctx.save_for_backward(unfolded_input, weight, bias)
 
         return output
 
@@ -100,52 +105,51 @@ class CustomConv2DFunction(Function):
           grad_bias: gradients of the bias term
 
         """
-        # compute the gradients w.r.t. input and params
-        x_unf, weight, bias = ctx.saved_tensors  # x_unf: (N, C_in*K*K, L)
+        # 1. Unpack saved tensors from the forward pass
+        unfolded_input, weight, bias = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
-        # recover the conv params
-        kernel_size = weight.size(2)
+        # 2. Recover convolution parameters saved in ctx
         stride = ctx.stride
         padding = ctx.padding
         input_height = ctx.input_height
         input_width = ctx.input_width
-
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
         
-        N, C_out, H_out, W_out = grad_output.shape
-        L = H_out * W_out
+        # Get dimensions from weight and grad_output
+        kernel_size = weight.size(2)
+        N, C_o, H_o, W_o = grad_output.shape
+        _, C_i, K, _ = weight.shape
+        L = H_o * W_o
 
-        # (N, C_out, L)
-        grad_out_cols = grad_output.reshape(N, C_out, L)
+        # 3. Reshape grad_output for matrix multiplication
+        reshaped_grad_output = grad_output.view(N, C_o, L)
 
-        # grad_weight
+        # 4. Compute the gradient with respect to the weights (grad_weight)
         if ctx.needs_input_grad[1]:
-            # (N, C_out, L) @ (N, L, C_in*K*K) -> (N, C_out, C_in*K*K) 
-            grad_w_flat = torch.bmm(grad_out_cols, x_unf.transpose(1, 2)).sum(dim=0)
-            grad_weight = grad_w_flat.view_as(weight)
+            grad_weight_reshaped = reshaped_grad_output @ unfolded_input.transpose(1, 2)
+            grad_weight = grad_weight_reshaped.sum(dim=0)
+            grad_weight = grad_weight.view(weight.shape)
 
-        # grad_input
+        # 5. Compute the gradient with respect to the input (grad_input)
         if ctx.needs_input_grad[0]:
-            # w_flat^T: (C_in*K*K, C_out)
-            w_flat_t = weight.view(C_out, -1).t().unsqueeze(0).expand(N, -1, -1)
-            # (N, C_in*K*K, C_out) @ (N, C_out, L) -> (N, C_in*K*K, L)
-            grad_x_unf = torch.bmm(w_flat_t, grad_out_cols)
+            reshaped_weight_t = weight.view(C_o, -1).t()
+            grad_unfolded = reshaped_weight_t @ reshaped_grad_output
             grad_input = fold(
-                grad_x_unf,
+                grad_unfolded,
                 output_size=(input_height, input_width),
-                kernel_size=kernel_size,
+                kernel_size=(K, K),
                 padding=padding,
                 stride=stride,
             )
 
+        # 6. Compute the gradient with respect to the bias (grad_bias)
         if bias is not None and ctx.needs_input_grad[2]:
-            # compute the gradients w.r.t. bias (if any)
             grad_bias = grad_output.sum((0, 2, 3))
+        
+        # 7. (FIXED) Clone grad_input only if it's not None
+        grad_input_clone = grad_input.clone() if grad_input is not None else None
 
-        return grad_input, grad_weight, grad_bias, None, None
+        return grad_input_clone, grad_weight, grad_bias, None, None
 
 
 custom_conv2d = CustomConv2DFunction.apply
@@ -351,52 +355,123 @@ class BetterNet(nn.Module):
     
 better_cnn_model = BetterNet
 
-class BetterSimpleNet(nn.Module):
+# class BetterSimpleNet(nn.Module):
+#     def __init__(self, conv_op=nn.Conv2d, num_classes=100):
+#         super().__init__()
+#         # block1: 7×7 stem
+#         self.conv1 = conv_op(3, 64, 7, stride=2, padding=3, bias=False)
+#         self.bn1   = nn.BatchNorm2d(64)
+#         self.relu  = nn.ReLU(inplace=True)
+#         self.pool1 = nn.MaxPool2d(3, stride=2, padding=1)
+
+#         # block2
+#         self.conv2a = conv_op(64, 64, 3, padding=1, bias=False)
+#         self.bn2a   = nn.BatchNorm2d(64)
+#         self.conv2b = conv_op(64, 64, 3, padding=1, bias=False)
+#         self.bn2b   = nn.BatchNorm2d(64)
+
+#         # block3
+#         self.conv3a = conv_op(64, 128, 3, stride=2, padding=1, bias=False)
+#         self.bn3a   = nn.BatchNorm2d(128)
+#         self.conv3b = conv_op(128, 128, 3, padding=1, bias=False)
+#         self.bn3b   = nn.BatchNorm2d(128)
+
+#         self.avgpool = nn.AdaptiveAvgPool2d(1)
+#         self.fc = nn.Linear(128, num_classes)
+
+#     def forward(self, x):
+#         x = self.relu(self.bn1(self.conv1(x)))
+#         x = self.pool1(x)
+
+#         # residual block2
+#         identity = x
+#         out = self.relu(self.bn2a(self.conv2a(x)))
+#         out = self.bn2b(self.conv2b(out))
+#         out += identity
+#         x = self.relu(out)
+
+#         # residual block3
+#         identity = self.bn3a(self.conv3a(x))
+#         out = self.relu(identity)
+#         out = self.bn3b(self.conv3b(out))
+#         x = self.relu(out + identity)
+
+#         x = self.avgpool(x).flatten(1)
+#         x = self.fc(x)
+#         return x
+
+# better_simple_cnn_model = BetterSimpleNet
+
+
+class MyBetterNet(nn.Module):
+    # add Batch Normalization
     def __init__(self, conv_op=nn.Conv2d, num_classes=100):
-        super().__init__()
-        # block1: 7×7 stem
-        self.conv1 = conv_op(3, 64, 7, stride=2, padding=3, bias=False)
-        self.bn1   = nn.BatchNorm2d(64)
-        self.relu  = nn.ReLU(inplace=True)
-        self.pool1 = nn.MaxPool2d(3, stride=2, padding=1)
+        super(MyBetterNet, self).__init__()
+        
+        
+        self.features = nn.Sequential(
+            # conv1 block: conv 7x7
+            conv_op(3, 64, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(64), 
+            nn.ReLU(inplace=True),
+            
+            # max pooling 1/2
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            # conv2 block: bottleneck with BatchNorm
+            conv_op(64, 64, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(64), 
+            nn.ReLU(inplace=True),
+            
+            conv_op(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64), 
+            nn.ReLU(inplace=True),
+            
+            conv_op(64, 256, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(256), 
+            nn.ReLU(inplace=True),
+            
+            # max pooling 1/2
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            # conv3 block: bottleneck with BatchNorm
+            conv_op(256, 128, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            
+            conv_op(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128), 
+            nn.ReLU(inplace=True),
+            
+            conv_op(128, 512, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(512), 
+            nn.ReLU(inplace=True),
+        )
+        # global avg pooling + FC
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, num_classes)
 
-        # block2
-        self.conv2a = conv_op(64, 64, 3, padding=1, bias=False)
-        self.bn2a   = nn.BatchNorm2d(64)
-        self.conv2b = conv_op(64, 64, 3, padding=1, bias=False)
-        self.bn2b   = nn.BatchNorm2d(64)
-
-        # block3
-        self.conv3a = conv_op(64, 128, 3, stride=2, padding=1, bias=False)
-        self.bn3a   = nn.BatchNorm2d(128)
-        self.conv3b = conv_op(128, 128, 3, padding=1, bias=False)
-        self.bn3b   = nn.BatchNorm2d(128)
-
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(128, num_classes)
+    def reset_parameters(self):
+        # init all params
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu"
+                )
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.pool1(x)
-
-        # residual block2
-        identity = x
-        out = self.relu(self.bn2a(self.conv2a(x)))
-        out = self.bn2b(self.conv2b(out))
-        out += identity
-        x = self.relu(out)
-
-        # residual block3
-        identity = self.bn3a(self.conv3a(x))
-        out = self.relu(identity)
-        out = self.bn3b(self.conv3b(out))
-        x = self.relu(out + identity)
-
-        x = self.avgpool(x).flatten(1)
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
         x = self.fc(x)
         return x
 
-better_simple_cnn_model = BetterSimpleNet
+better_simple_cnn_model = MyBetterNet
 
 ################################################################################
 # Part II.1: Understanding self-attention and Transformer block
@@ -438,10 +513,22 @@ class Attention(nn.Module):
         )
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
-        return x
+        # Scaled dot-product attention
+        N = H * W  # number of tokens
+        # q, k, v: (B*num_heads, N, C_head)
+        attn = torch.matmul(q * self.scale, k.transpose(-2, -1))  # (B*num_heads, N, N)
+        attn = attn.softmax(dim=-1)
+        out = torch.matmul(attn, v)  # (B*num_heads, N, C_head)
+
+        # reshape back to (B, N, C) then to (B, H, W, C)
+        out = out.view(B, self.num_heads, N, -1)             # (B, num_heads, N, C_head)
+        out = out.permute(0, 2, 1, 3).contiguous()           # (B, N, num_heads, C_head)
+        out = out.view(B, N, -1)                             # (B, N, C)
+        out = self.proj(out)                                 # (B, N, C)
+
+        # restore spatial layout
+        out = out.view(B, H, W, -1)                          # (B, H, W, C)
+        return out
 
 
 class TransformerBlock(nn.Module):
@@ -491,24 +578,19 @@ class TransformerBlock(nn.Module):
         shortcut = x
         x = self.norm1(x)
 
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
         # The implementation shall support local self-attention
         # (also known as window attention)
 
         # MLP after MSA, both can be dropped at random
         
         if self.window_size and self.window_size > 0:
-            # 局部窗口注意力
             x_windows, pad_hw = window_partition(x, self.window_size)   # (B*nW, w, w, C)
-            x_windows = self.attn(x_windows)                            # 同形状 (B*nW, w, w, C)
-            x = window_unpartition(x_windows, self.window_size, pad_hw) # 还原到 (B, H, W, C)
+            x_windows = self.attn(x_windows)                            # (B*nW, w, w, C)
+            x = window_unpartition(x_windows, self.window_size, pad_hw) # (B, H, W, C)
         else:
-            # 全局注意力
             x = self.attn(x)
 
-        # 残差 + MLP
+        # Residual + MLP
         x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
@@ -590,9 +672,6 @@ class SimpleViT(nn.Module):
             embed_dim=embed_dim,
         )
 
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
         # The implementation shall define some Transformer blocks
         self.blocks = nn.ModuleList([
             TransformerBlock(
@@ -627,9 +706,6 @@ class SimpleViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
         # Patch embedding: (B, C_in, H, W) -> (B, H', W', C)
         x = self.patch_embed(x)
 
