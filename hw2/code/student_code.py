@@ -436,6 +436,30 @@ class SimpleViT(nn.Module):
         ########################################################################
         # The implementation shall define some Transformer blocks
 
+        blocks = []
+        for i in range(depth):
+            use_window = (i in window_block_indexes)
+            # set window size only when using windowed attention
+            ws = window_size if use_window else 0
+            blocks.append(
+                TransformerBlock(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    drop_path=dpr[i],
+                    norm_layer=norm_layer,
+                    act_layer=act_layer,
+                    window_size=ws,
+                )
+            )
+
+        self.blocks = nn.Sequential(*blocks)
+
+        self.norm = norm_layer(embed_dim)
+
+        self.head = nn.Linear(embed_dim, num_classes)
+
         if self.pos_embed is not None:
             trunc_normal_(self.pos_embed, std=0.02)
 
@@ -455,6 +479,33 @@ class SimpleViT(nn.Module):
         ########################################################################
         # Fill in the code here
         ########################################################################
+
+        B, C, H, W = x.shape
+        x = self.patch_embed(x)
+
+        H_p, W_p = x.shape[1], x.shape[2]
+
+        # add absolute positional embedding if provided; resize if needed
+        if self.pos_embed is not None:
+            pe = self.pos_embed
+            # pe shape: 1 x H0 x W0 x C
+            if pe.shape[1] != H_p or pe.shape[2] != W_p:
+                # need to resize positional embedding
+                old_h, old_w = pe.shape[1], pe.shape[2]
+                pe_np = pe.detach().cpu().numpy().squeeze(0)
+                resized = resize_image(
+                    pe_np, (W_p, H_p), interpolation=1
+                )
+                pe = torch.from_numpy(resized).unsqueeze(0).to(x.device)
+            # broadcast and add
+            x = x + pe
+
+        # apply transformer blocks
+        x = self.blocks(x)
+        x = self.norm(x)
+        x = x.mean(dim=(1, 2))
+        x = self.head(x)
+        
         return x
 
 # change this to your model!
