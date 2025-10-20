@@ -11,7 +11,7 @@ from utils import resize_image
 import custom_transforms as transforms
 from custom_blocks import (PatchEmbed, window_partition, window_unpartition,
                            DropPath, MLP, trunc_normal_)
-
+import torch.nn.functional as F
 
 ################################################################################
 # You will need to fill in the missing code in this file
@@ -46,7 +46,7 @@ class CustomConv2DFunction(Function):
         assert isinstance(stride, int) and (stride > 0)
         assert isinstance(padding, int) and (padding >= 0)
 
-        # save the conv params
+        # save the conv params for the backward pass
         kernel_size = weight.size(2)
         ctx.stride = stride
         ctx.padding = padding
@@ -56,13 +56,38 @@ class CustomConv2DFunction(Function):
         # make sure this is a valid convolution
         assert kernel_size <= (input_feats.size(2) + 2 * padding)
         assert kernel_size <= (input_feats.size(3) + 2 * padding)
+        
+        # 1. Get input and weight dimensions
+        N, C_i, H_i, W_i = input_feats.shape
+        C_o, _, K, _ = weight.shape
 
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
+        # 2. Calculate the output feature map dimensions
+        H_o = (H_i + 2 * padding - K) // stride + 1
+        W_o = (W_i + 2 * padding - K) // stride + 1
 
-        # save for backward (you need to save the unfolded tensor into ctx)
-        # ctx.save_for_backward(your_vars, weight, bias)
+        # 3. Use unfold (im2col) to extract sliding windows as columns
+        unfolded_input = unfold(
+            input_feats,
+            kernel_size=(K, K),
+            padding=padding,
+            stride=stride
+        )
+
+        # 4. Reshape the weight into a matrix for multiplication
+        reshaped_weight = weight.view(C_o, -1)
+
+        # 5. Perform the core matrix multiplication
+        output = reshaped_weight @ unfolded_input
+
+        # 6. Add the bias term if it exists
+        if bias is not None:
+            output += bias.view(1, -1, 1)
+
+        # 7. Reshape the output back to the standard image format
+        output = output.view(N, C_o, H_o, W_o)
+
+        # Save the unfolded input and weight for the backward pass
+        ctx.save_for_backward(unfolded_input, weight, bias)
 
         return output
 
@@ -80,27 +105,51 @@ class CustomConv2DFunction(Function):
           grad_bias: gradients of the bias term
 
         """
-        # unpack tensors and initialize the grads
-        # your_vars, weight, bias = ctx.saved_tensors
+        # 1. Unpack saved tensors from the forward pass
+        unfolded_input, weight, bias = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
-        # recover the conv params
-        kernel_size = weight.size(2)
+        # 2. Recover convolution parameters saved in ctx
         stride = ctx.stride
         padding = ctx.padding
         input_height = ctx.input_height
         input_width = ctx.input_width
+        
+        # Get dimensions from weight and grad_output
+        kernel_size = weight.size(2)
+        N, C_o, H_o, W_o = grad_output.shape
+        _, C_i, K, _ = weight.shape
+        L = H_o * W_o
 
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
-        # compute the gradients w.r.t. input and params
+        # 3. Reshape grad_output for matrix multiplication
+        reshaped_grad_output = grad_output.view(N, C_o, L)
 
+        # 4. Compute the gradient with respect to the weights (grad_weight)
+        if ctx.needs_input_grad[1]:
+            grad_weight_reshaped = reshaped_grad_output @ unfolded_input.transpose(1, 2)
+            grad_weight = grad_weight_reshaped.sum(dim=0)
+            grad_weight = grad_weight.view(weight.shape)
+
+        # 5. Compute the gradient with respect to the input (grad_input)
+        if ctx.needs_input_grad[0]:
+            reshaped_weight_t = weight.view(C_o, -1).t()
+            grad_unfolded = reshaped_weight_t @ reshaped_grad_output
+            grad_input = fold(
+                grad_unfolded,
+                output_size=(input_height, input_width),
+                kernel_size=(K, K),
+                padding=padding,
+                stride=stride,
+            )
+
+        # 6. Compute the gradient with respect to the bias (grad_bias)
         if bias is not None and ctx.needs_input_grad[2]:
-            # compute the gradients w.r.t. bias (if any)
             grad_bias = grad_output.sum((0, 2, 3))
+        
+        # 7. (FIXED) Clone grad_input only if it's not None
+        grad_input_clone = grad_input.clone() if grad_input is not None else None
 
-        return grad_input, grad_weight, grad_bias, None, None
+        return grad_input_clone, grad_weight, grad_bias, None, None
 
 
 custom_conv2d = CustomConv2DFunction.apply
@@ -213,7 +262,7 @@ class SimpleNet(nn.Module):
                     m.weight, mode="fan_out", nonlinearity="relu"
                 )
                 if m.bias is not None:
-                    nn.init.consintat_(m.bias, 0.0)
+                    nn.init.constant_(m.bias, 0.0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
@@ -230,6 +279,199 @@ class SimpleNet(nn.Module):
 
 # change this to your model!
 default_cnn_model = SimpleNet
+
+
+def conv3x3(conv_op, in_ch, out_ch, stride=1):
+    return conv_op(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, conv_op, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv1 = conv3x3(conv_op, in_ch, out_ch, stride)
+        self.bn1   = nn.BatchNorm2d(out_ch)
+        self.relu  = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(conv_op, out_ch, out_ch, 1)
+        self.bn2   = nn.BatchNorm2d(out_ch)
+
+        self.downsample = None
+        if stride != 1 or in_ch != out_ch:
+            self.downsample = nn.Sequential(
+                conv_op(in_ch, out_ch, kernel_size=1, stride=stride, padding=0, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out = self.relu(out + identity)
+        return out
+
+class BetterNet(nn.Module):
+    def __init__(self, conv_op=nn.Conv2d, num_classes=100, dropout_p=0.2):
+        super().__init__()
+        self.conv1 = conv3x3(conv_op, 3, 64, stride=1)
+        self.bn1   = nn.BatchNorm2d(64)
+        self.relu  = nn.ReLU(inplace=True)
+
+        self.layer1 = self._make_layer(conv_op, 64,  64,  blocks=2, stride=1)  # 32x32
+        self.layer2 = self._make_layer(conv_op, 64,  128, blocks=2, stride=2)  # 16x16
+        self.layer3 = self._make_layer(conv_op, 128, 256, blocks=2, stride=2)  # 8x8
+        self.layer4 = self._make_layer(conv_op, 256, 512, blocks=2, stride=2)  # 4x4
+
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(p=dropout_p)
+        self.fc = nn.Linear(512, num_classes)
+
+        self._init_weights()
+
+    def _make_layer(self, conv_op, in_ch, out_ch, blocks, stride):
+        layers = [BasicBlock(conv_op, in_ch, out_ch, stride)]
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(conv_op, out_ch, out_ch, 1))
+        return nn.Sequential(*layers)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.layer1(x); x = self.layer2(x); x = self.layer3(x); x = self.layer4(x)
+        x = self.avgpool(x).flatten(1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+    
+better_cnn_model = BetterNet
+
+# class BetterSimpleNet(nn.Module):
+#     def __init__(self, conv_op=nn.Conv2d, num_classes=100):
+#         super().__init__()
+#         # block1: 7×7 stem
+#         self.conv1 = conv_op(3, 64, 7, stride=2, padding=3, bias=False)
+#         self.bn1   = nn.BatchNorm2d(64)
+#         self.relu  = nn.ReLU(inplace=True)
+#         self.pool1 = nn.MaxPool2d(3, stride=2, padding=1)
+
+#         # block2
+#         self.conv2a = conv_op(64, 64, 3, padding=1, bias=False)
+#         self.bn2a   = nn.BatchNorm2d(64)
+#         self.conv2b = conv_op(64, 64, 3, padding=1, bias=False)
+#         self.bn2b   = nn.BatchNorm2d(64)
+
+#         # block3
+#         self.conv3a = conv_op(64, 128, 3, stride=2, padding=1, bias=False)
+#         self.bn3a   = nn.BatchNorm2d(128)
+#         self.conv3b = conv_op(128, 128, 3, padding=1, bias=False)
+#         self.bn3b   = nn.BatchNorm2d(128)
+
+#         self.avgpool = nn.AdaptiveAvgPool2d(1)
+#         self.fc = nn.Linear(128, num_classes)
+
+#     def forward(self, x):
+#         x = self.relu(self.bn1(self.conv1(x)))
+#         x = self.pool1(x)
+
+#         # residual block2
+#         identity = x
+#         out = self.relu(self.bn2a(self.conv2a(x)))
+#         out = self.bn2b(self.conv2b(out))
+#         out += identity
+#         x = self.relu(out)
+
+#         # residual block3
+#         identity = self.bn3a(self.conv3a(x))
+#         out = self.relu(identity)
+#         out = self.bn3b(self.conv3b(out))
+#         x = self.relu(out + identity)
+
+#         x = self.avgpool(x).flatten(1)
+#         x = self.fc(x)
+#         return x
+
+# better_simple_cnn_model = BetterSimpleNet
+
+
+class MyBetterNet(nn.Module):
+    # add Batch Normalization
+    def __init__(self, conv_op=nn.Conv2d, num_classes=100):
+        super(MyBetterNet, self).__init__()
+        
+        
+        self.features = nn.Sequential(
+            # conv1 block: conv 7x7
+            conv_op(3, 64, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(64), 
+            nn.ReLU(inplace=True),
+            
+            # max pooling 1/2
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            # conv2 block: bottleneck with BatchNorm
+            conv_op(64, 64, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(64), 
+            nn.ReLU(inplace=True),
+            
+            conv_op(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64), 
+            nn.ReLU(inplace=True),
+            
+            conv_op(64, 256, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(256), 
+            nn.ReLU(inplace=True),
+            
+            # max pooling 1/2
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            
+            # conv3 block: bottleneck with BatchNorm
+            conv_op(256, 128, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            
+            conv_op(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128), 
+            nn.ReLU(inplace=True),
+            
+            conv_op(128, 512, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(512), 
+            nn.ReLU(inplace=True),
+        )
+        # global avg pooling + FC
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, num_classes)
+
+    def reset_parameters(self):
+        # init all params
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu"
+                )
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+better_simple_cnn_model = MyBetterNet
 
 ################################################################################
 # Part II.1: Understanding self-attention and Transformer block
@@ -271,10 +513,23 @@ class Attention(nn.Module):
         )
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
-        return x
+        # Scaled dot-product attention
+        N = H * W  # number of tokens
+        # q, k, v: (B*num_heads, N, C_head)
+        attn = torch.matmul(q * self.scale, k.transpose(-2, -1))  # (B*num_heads, N, N)
+        attn = attn.softmax(dim=-1)
+        out = torch.matmul(attn, v)  # (B*num_heads, N, C_head)
+
+        # reshape back to (B, N, C) then to (B, H, W, C)
+        out = out.view(B, self.num_heads, N, -1)             # (B, num_heads, N, C_head)
+        out = out.permute(0, 2, 1, 3).contiguous()           # (B, N, num_heads, C_head)
+        out = out.view(B, N, -1)                             # (B, N, C)
+        out = self.proj(out)                                 # (B, N, C)
+
+        # restore spatial layout
+        out = out.view(B, H, W, -1)                          # (B, H, W, C)
+        return out
+
 
 class TransformerBlock(nn.Module):
     """Transformer blocks with support of local window self-attention"""
@@ -322,16 +577,16 @@ class TransformerBlock(nn.Module):
     def forward(self, x):
         shortcut = x
         x = self.norm1(x)
+        if self.window_size and self.window_size > 0:
+            H, W = x.shape[1], x.shape[2]      # x: (B, H, W, C)
+            x_windows, pad_hw = window_partition(x, self.window_size)   # (B*nW, w, w, C)
+            x_windows = self.attn(x_windows)
+            x = window_unpartition(x_windows, self.window_size, pad_hw, (H, W))
+        else:
+            x = self.attn(x)
 
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
-        # The implementation shall support local self-attention
-        # (also known as window attention)
-
-        # MLP after MSA, both can be dropped at random
-        # x = shortcut + self.drop_path(x)
-        # x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -411,10 +666,23 @@ class SimpleViT(nn.Module):
             embed_dim=embed_dim,
         )
 
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
         # The implementation shall define some Transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop_path=dpr[i],
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                window_size=(window_size if (i in window_block_indexes) else 0),
+            )
+            for i in range(depth)
+        ])
+
+        self.norm = norm_layer(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
 
         if self.pos_embed is not None:
             trunc_normal_(self.pos_embed, std=0.02)
@@ -432,9 +700,20 @@ class SimpleViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
+        # Patch embedding: (B, C_in, H, W) -> (B, H', W', C)
+        x = self.patch_embed(x)
+
+        if self.pos_embed is not None:
+            # pos_embed: (1, H', W', C)
+            x = x + self.pos_embed
+
+        # Transformer blocks
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        x = x.mean(dim=(1, 2))
+        x = self.head(x)
         return x
 
 # change this to your model!
@@ -511,12 +790,39 @@ class PGDAttack(object):
         input.requires_grad = False
 
         # loop over the number of steps
-        # for _ in range(self.num_steps):
+        for _ in range(self.num_steps):
         ########################################################################
-        # Fill in the code here
+            # start by enabling grad for the current adv example
+            output.requires_grad = True
+
+            # forward pass
+            logits = model(output)
+
+            # determine least-likely (target) label once at the first step
+            if _ == 0:
+                probs0 = torch.softmax(logits.detach(), dim=1)
+                target_labels = torch.argmin(probs0, dim=1).to(output.device)
+
+            # compute targeted loss (minimize loss towards the least-likely label)
+            loss = self.loss_fn(logits, target_labels)
+
+            # compute gradient w.r.t. the adversarial input
+            grad = torch.autograd.grad(loss, output, retain_graph=False, create_graph=False)[0]
+
+            # take a step to minimize the loss toward the target (targeted attack)
+            output = output - self.step_size * torch.sign(grad)
+
+            # project back to the l_inf ball around the original input
+            delta = output - input
+            delta = torch.clamp(delta, min=-self.epsilon, max=self.epsilon)
+            output = (input + delta).detach()
+
+            # disable grad for next iteration
+            output.requires_grad = False
         ########################################################################
 
         return output
+
 
 default_attack = PGDAttack
 
@@ -537,3 +843,86 @@ def vis_grid(input, n_rows=10):
     return output_imgs
 
 default_visfunction = vis_grid
+
+class AdvSimpleNet(nn.Module):
+    """
+    Same architecture as SimpleNet, but the forward pass includes:
+      1) De-normalizing the input back to pixel space [0,1]
+      2) Generating adversarial samples in pixel space using the provided PGDAttack
+      3) Re-normalizing the adversarial samples and completing the forward pass
+
+    Notes:
+      - Requires an 'attack' argument (an instance of your PGDAttack)
+      - Assumes ImageNet mean/std normalization is used during training and data augmentation
+      - Temporarily switches to eval() mode during adversarial crafting to avoid BN statistics contamination,
+        then restores training mode afterwards
+    """
+    def __init__(self, attack, conv_op=nn.Conv2d, num_classes=100):
+        super().__init__()
+        assert attack is not None, "Must provide a PGDAttack instance"
+        self.attack = attack
+
+        self.features = nn.Sequential(
+            conv_op(3, 64, kernel_size=7, stride=2, padding=3),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            conv_op(64, 64, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(inplace=True),
+            conv_op(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            conv_op(64, 256, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            conv_op(256, 128, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(inplace=True),
+            conv_op(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            conv_op(128, 512, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(inplace=True),
+        )
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, num_classes)
+
+        # mean / std from ImageNet for normalization
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
+        self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
+
+    # Shared forward implementation (no adversarial generation to avoid recursion)
+    def _forward_impl(self, x_norm):
+        x = self.features(x_norm)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+    def forward(self, x_norm):
+        """
+        x_norm: normalized input (same normalization as data augmentation)
+        Returns: logits computed on PGD-generated adversarial samples
+        """
+        if not self.training:
+            return self._forward_impl(x_norm)
+
+        # 1) De-normalize input to pixel space [0,1]
+        x_pixel = (x_norm * self.std + self.mean).clamp(0.0, 1.0)
+
+        # 2) Construct a model adapter for PGDAttack: pixel -> normalized -> _forward_impl
+        def model_adapter(inp_pixel):
+            # inp_pixel is in [0,1], re-normalize it and run the shared forward
+            inp_norm = (inp_pixel - self.mean) / self.std
+            return self._forward_impl(inp_norm)
+
+        # 3) Adversarial crafting: temporarily switch to eval() to avoid BN stat pollution
+        was_training = self.training
+        self.eval()
+        x_adv_pixel = self.attack.perturb(model_adapter, x_pixel)  # pixel-space PGD
+        if was_training:
+            self.train()
+
+        # 4) Re-normalize the adversarial sample and complete the actual forward
+        x_adv_norm = (x_adv_pixel - self.mean) / self.std
+        logits = self._forward_impl(x_adv_norm)
+        return logits
+
+default_ad_conv_model = AdvSimpleNet
+

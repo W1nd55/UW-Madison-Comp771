@@ -3,3 +3,4 @@ opencv-python>=3.0
 numpy
 gdown
 tensorboard
+torchvision
