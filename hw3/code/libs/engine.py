@@ -161,7 +161,7 @@ def evaluate(
                         "image_id": image_id,
                         "category_id": int(label),
                         "bbox": box,
-                        "score": score,
+                        "score": score
                     }
                 )
 

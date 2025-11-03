@@ -55,7 +55,7 @@ class FCOSClassificationHead(nn.Module):
             self.cls_logits.bias, -math.log((1 - prior_probability) / prior_probability)
         )
 
-    def forward(self, x):
+    def forward(self, xs):
         """
         Fill in the missing code here. The head will be applied to all levels
         of the feature pyramid, and predict a single logit for each location on
@@ -70,7 +70,11 @@ class FCOSClassificationHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x
+        outs = []
+        for x in xs:
+            y = self.conv(x)
+            outs.append(self.cls_logits(y))
+        return outs
 
 
 class FCOSRegressionHead(nn.Module):
@@ -116,7 +120,7 @@ class FCOSRegressionHead(nn.Module):
             torch.nn.init.normal_(m.weight, std=0.01)
             torch.nn.init.zeros_(m.bias)
 
-    def forward(self, x):
+    def forward(self, xs):
         """
         Fill in the missing code here. The logic is rather similar to
         FCOSClassificationHead. The key difference is that this head bundles both
@@ -131,7 +135,12 @@ class FCOSRegressionHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x, x
+        reg_outs, ctr_outs = [], []
+        for x in xs:
+            y = self.conv(x)
+            reg_outs.append(self.bbox_reg(y))
+            ctr_outs.append(self.bbox_ctrness(y))
+        return reg_outs, ctr_outs
 
 
 class FCOS(nn.Module):
@@ -322,7 +331,7 @@ class FCOS(nn.Module):
 
         # 2D points (corresponding to feature locations) of shape H x W x 2
         points, strides, reg_range = self.point_generator(fpn_features)
-
+        
         # training / inference
         if self.training:
             # training: generate GT labels, and compute the loss
@@ -375,7 +384,10 @@ class FCOS(nn.Module):
     def compute_loss(
         self, targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
     ):
-        return losses
+        """
+        Compute FCOS losses including classification, regression, and centerness.
+        """
+        pass
 
     """
     Fill in the missing code here. The inference is also a bit involved. It is
@@ -414,4 +426,151 @@ class FCOS(nn.Module):
     def inference(
         self, points, strides, cls_logits, reg_outputs, ctr_logits, image_shapes
     ):
+        # points: (5,H,W,2) list
+        # strides: (5,) tensor
+        # cls_logits: (5, N,C,H,W) list
+        # reg_outputs: (5, N,4,H,W) list
+        # ctr_logits: (5, N,1,H,W) list
+        # image_shapes: (N, H,W) list
+        device = cls_logits[0].device
+        N = cls_logits[0].shape[0]
+        Lvl = len(cls_logits)
+        C = self.num_classes
+
+        detections = []
+
+        # helper: clip & valid
+        def _clip_and_valid(boxes, img_h, img_w, min_size=0.0):
+            boxes[:, 0].clamp_(0, img_w)
+            boxes[:, 2].clamp_(0, img_w)
+            boxes[:, 1].clamp_(0, img_h)
+            boxes[:, 3].clamp_(0, img_h)
+            ws = boxes[:, 2] - boxes[:, 0]
+            hs = boxes[:, 3] - boxes[:, 1]
+            valid = (ws > 0) & (hs > 0)
+            if min_size > 0:
+                valid = valid & (ws >= min_size) & (hs >= min_size)
+            return boxes, valid
+
+        for n in range(N):
+            boxes_all, scores_all, labels_all = [], [], []
+
+            # decide once per image whether points are (x,y) or (y,x)
+            orientation_xy = True  # default assume (x,y)
+            decided = False
+
+            for lvl in range(Lvl):
+                cls_lvl = cls_logits[lvl][n]    # [C,H,W]
+                ctr_lvl = ctr_logits[lvl][n]    # [1,H,W]
+                reg_lvl = reg_outputs[lvl][n]   # [4,H,W]
+                H, W = reg_lvl.shape[-2], reg_lvl.shape[-1]
+                L = H * W
+                if L == 0:
+                    continue
+
+                pts = points[lvl].reshape(-1, 2).to(device)      # [L,2]
+                cls_prob = cls_lvl.sigmoid().reshape(C, L)       # [C,L]
+                ctr_prob = ctr_lvl.sigmoid().reshape(1, L)       # [1,L]
+                scores = (cls_prob * ctr_prob)                   # [C,L]
+                scores_flat = scores.reshape(-1)                 # [C*L]
+
+                # threshold first
+                keep_idx = torch.nonzero(scores_flat > self.score_thresh, as_tuple=False).squeeze(1)
+                if keep_idx.numel() == 0:
+                    continue
+
+                # per-level topk (optional; if <=0 or None -> skip)
+                if getattr(self, "topk_candidates", None) and self.topk_candidates > 0 and keep_idx.numel() > self.topk_candidates:
+                    kept_scores = scores_flat[keep_idx]
+                    topk_scores, topk_pos = torch.topk(kept_scores, self.topk_candidates, sorted=False)
+                    flat_idx = keep_idx[topk_pos]
+                    sel_scores = topk_scores
+                else:
+                    flat_idx = keep_idx
+                    sel_scores = scores_flat[flat_idx]
+
+                # correct unravel: i in [0, C*L) -> (c, l)
+                sel_c = (flat_idx // L).to(torch.int64)   # [M]
+                sel_l = (flat_idx %  L).to(torch.int64)   # [M]
+
+                sel_pts = pts[sel_l]                                   # [M,2]
+                reg_flat = reg_lvl.reshape(4, L)[:, sel_l]             # [4,M]
+                s = strides[lvl]
+                l = reg_flat[0] * s
+                t = reg_flat[1] * s
+                r = reg_flat[2] * s
+                b = reg_flat[3] * s
+
+                # one-time orientation decision on first non-empty level
+                if not decided:
+                    # try both
+                    img_h, img_w = image_shapes[n]
+                    x1a = sel_pts[:, 0] - l; y1a = sel_pts[:, 1] - t
+                    x2a = sel_pts[:, 0] + r; y2a = sel_pts[:, 1] + b
+                    boxes_a = torch.stack([x1a, y1a, x2a, y2a], dim=1)
+                    boxes_a, va = _clip_and_valid(boxes_a, img_h, img_w)
+
+                    x1b = sel_pts[:, 1] - l; y1b = sel_pts[:, 0] - t
+                    x2b = sel_pts[:, 1] + r; y2b = sel_pts[:, 0] + b
+                    boxes_b = torch.stack([x1b, y1b, x2b, y2b], dim=1)
+                    boxes_b, vb = _clip_and_valid(boxes_b, img_h, img_w)
+
+                    # decide by #valid (tie -> keep default (x,y))
+                    if vb.sum() > va.sum():
+                        orientation_xy = False
+                    decided = True
+
+                # decode with chosen orientation
+                if orientation_xy:
+                    x1 = sel_pts[:, 0] - l; y1 = sel_pts[:, 1] - t
+                    x2 = sel_pts[:, 0] + r; y2 = sel_pts[:, 1] + b
+                else:
+                    x1 = sel_pts[:, 1] - l; y1 = sel_pts[:, 0] - t
+                    x2 = sel_pts[:, 1] + r; y2 = sel_pts[:, 0] + b
+
+                boxes = torch.stack([x1, y1, x2, y2], dim=1)          # [M,4]
+                img_h, img_w = image_shapes[n]
+                boxes, valid = _clip_and_valid(boxes, img_h, img_w, min_size=0.1)  # min_size可改>0以去除极小框
+
+                if valid.any():
+                    boxes = boxes[valid]
+                    score_sel = sel_scores[valid]
+
+                    label_sel = sel_c[valid] + 1  # fallback
+
+                    boxes_all.append(boxes)
+                    scores_all.append(score_sel)
+                    labels_all.append(label_sel)
+
+            if len(boxes_all) == 0:
+                detections.append(
+                    {
+                        "boxes":  torch.zeros((0, 4), device=device),
+                        "scores": torch.zeros((0,), device=device),
+                        "labels": torch.zeros((0,), dtype=torch.int64, device=device),
+                    }
+                )
+                continue
+
+            boxes_all  = torch.cat(boxes_all,  dim=0)
+            scores_all = torch.cat(scores_all, dim=0)
+            labels_all = torch.cat(labels_all, dim=0)
+
+            # class-wise NMS
+            keep = batched_nms(boxes_all, scores_all, labels_all, self.nms_thresh)
+            
+            # sort by score desc to keep strongest ones
+            keep = keep[scores_all[keep].argsort(descending=True)]
+
+            if keep.numel() > self.detections_per_img:
+                keep = keep[: self.detections_per_img]
+
+            detections.append(
+                {
+                    "boxes":  boxes_all[keep],
+                    "scores": scores_all[keep],
+                    "labels": labels_all[keep],
+                }
+            )
+
         return detections
