@@ -1,0 +1,105 @@
+{'dataset': {'img_folder': '../data/VOCdevkit/VOC2007/JPEGImages',
+             'json_folder': '../data',
+             'name': 'VOC2007',
+             'test': 'test',
+             'train': 'trainval'},
+ 'devices': ['cuda:0'],
+ 'dtype': 'fp16',
+ 'input': {'img_max_size': 640,
+           'img_mean': [0.485, 0.456, 0.406],
+           'img_min_size': [288, 320, 352, 384, 416, 448, 480],
+           'img_std': [0.229, 0.224, 0.225]},
+ 'loader': {'batch_size': 32, 'num_workers': 4},
+ 'model': {'backbone': 'resnet18',
+           'backbone_freeze_bn': False,
+           'backbone_out_feats': ['layer2', 'layer3', 'layer4'],
+           'backbone_out_feats_dims': [128, 256, 512],
+           'fpn_feats_dim': 128,
+           'fpn_strides': [8, 16, 32, 64, 128],
+           'img_max_size': 640,
+           'img_mean': [0.485, 0.456, 0.406],
+           'img_min_size': [288, 320, 352, 384, 416, 448, 480],
+           'img_std': [0.229, 0.224, 0.225],
+           'num_classes': 20,
+           'regression_range': [(0, 64),
+                                (64, 128),
+                                (128, 256),
+                                (256, 512),
+                                (512, 1000)],
+           'test_cfg': {'detections_per_img': 100,
+                        'nms_thresh': 0.6,
+                        'score_thresh': 0.1,
+                        'topk_candidates': 1000},
+           'train_cfg': {'center_sampling_radius': 1.5}},
+ 'model_name': 'FCOS',
+ 'opt': {'epochs': 12,
+         'learning_rate': 0.02,
+         'momentum': 0.9,
+         'schedule_gamma': 0.1,
+         'schedule_steps': [],
+         'schedule_type': 'cosine',
+         'type': 'SGD',
+         'warmup': True,
+         'warmup_epochs': 3,
+         'weight_decay': 0.0001},
+ 'output_folder': '../logs',
+ 'test_cfg': {'detections_per_img': 100,
+              'nms_thresh': 0.6,
+              'score_thresh': 0.1,
+              'topk_candidates': 1000},
+ 'train_cfg': {'center_sampling_radius': 1.5}}
+loading annotations into memory...
+Done (t=0.04s)
+creating index...
+index created!
+/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataloader.py:627: UserWarning: This DataLoader will create 4 worker processes in total. Our suggested max number of worker in current system is 2, which is smaller than what this DataLoader is going to create. Please be aware that excessive worker creation might get DataLoader running slow or even freeze, lower the worker number to avoid potential slowness/freeze if necessary.
+  warnings.warn(
+=> loading checkpoint '../pretrained/voc_res18.pth.tar'
+Loading model ...
+
+Start testing ...
+/usr/local/lib/python3.12/dist-packages/torch/utils/data/dataloader.py:627: UserWarning: This DataLoader will create 4 worker processes in total. Our suggested max number of worker in current system is 2, which is smaller than what this DataLoader is going to create. Please be aware that excessive worker creation might get DataLoader running slow or even freeze, lower the worker number to avoid potential slowness/freeze if necessary.
+  warnings.warn(
+/usr/local/lib/python3.12/dist-packages/torchvision/utils.py:349: UserWarning: boxes doesn't contain any box. No box was drawn
+  warnings.warn("boxes doesn't contain any box. No box was drawn")
+Test: [00010/00155]	Time 1.20 (1.20)
+Test: [00020/00155]	Time 1.17 (1.18)
+Test: [00030/00155]	Time 1.14 (1.17)
+Test: [00040/00155]	Time 1.14 (1.16)
+Test: [00050/00155]	Time 1.16 (1.16)
+Test: [00060/00155]	Time 1.15 (1.16)
+Test: [00070/00155]	Time 1.16 (1.16)
+Test: [00080/00155]	Time 1.16 (1.16)
+Test: [00090/00155]	Time 1.16 (1.16)
+Test: [00100/00155]	Time 1.15 (1.16)
+Test: [00110/00155]	Time 1.12 (1.16)
+Test: [00120/00155]	Time 1.14 (1.15)
+Test: [00130/00155]	Time 1.17 (1.15)
+Test: [00140/00155]	Time 1.16 (1.16)
+Test: [00150/00155]	Time 1.16 (1.16)
+loading annotations into memory...
+Done (t=0.04s)
+creating index...
+index created!
+Loading and preparing results...
+DONE (t=0.48s)
+creating index...
+index created!
+Running per image evaluation...
+Evaluate annotation type *bbox*
+DONE (t=8.04s).
+Accumulating evaluation results...
+DONE (t=2.30s).
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.326
+ Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.601
+ Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.319
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.075
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.197
+ Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.402
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.315
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.470
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.485
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.151
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.363
+ Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.569
+All done! Total time: 191.19 sec
