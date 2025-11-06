@@ -70,7 +70,17 @@ class FCOSClassificationHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x
+        cls_logits = []
+        
+        # Process each level of the feature pyramid
+        for feature in x:
+            # Apply shared conv layers
+            conv_out = self.conv(feature)
+            # Apply classification logits layer
+            logits = self.cls_logits(conv_out)
+            cls_logits.append(logits)
+        
+        return cls_logits
 
 
 class FCOSRegressionHead(nn.Module):
@@ -131,7 +141,22 @@ class FCOSRegressionHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x, x
+        reg_outputs = []
+        ctr_logits = []
+        
+        # Process each level of the feature pyramid
+        for feature in x:
+            # Apply shared conv layers
+            conv_out = self.conv(feature)
+            # Apply regression prediction (distances to box edges)
+            bbox_reg = self.bbox_reg(conv_out)
+            # Apply center-ness prediction
+            bbox_ctrness = self.bbox_ctrness(conv_out)
+            
+            reg_outputs.append(bbox_reg)
+            ctr_logits.append(bbox_ctrness)
+        
+        return reg_outputs, ctr_logits
 
 
 class FCOS(nn.Module):
@@ -414,4 +439,140 @@ class FCOS(nn.Module):
     def inference(
         self, points, strides, cls_logits, reg_outputs, ctr_logits, image_shapes
     ):
+        detections = []
+        batch_size = cls_logits[0].shape[0]
+        
+        # Process each image in the batch
+        for img_idx in range(batch_size):
+            img_boxes = []
+            img_scores = []
+            img_labels = []
+            img_shape = image_shapes[img_idx]
+            
+            # Process each FPN level
+            for level_idx in range(len(cls_logits)):
+                # Get predictions for this level
+                cls_logits_level = cls_logits[level_idx][img_idx]  # C x H x W
+                reg_outputs_level = reg_outputs[level_idx][img_idx]  # 4 x H x W
+                ctr_logits_level = ctr_logits[level_idx][img_idx]  # 1 x H x W
+                points_level = points[level_idx]  # H x W x 2
+                stride_level = strides[level_idx]
+                
+                # Get dimensions
+                num_classes = cls_logits_level.shape[0]
+                H, W = cls_logits_level.shape[1:3]
+                
+                # Reshape tensors for easier processing
+                cls_logits_level = cls_logits_level.permute(1, 2, 0).reshape(-1, num_classes)  # (H*W) x C
+                reg_outputs_level = reg_outputs_level.permute(1, 2, 0).reshape(-1, 4)  # (H*W) x 4
+                ctr_logits_level = ctr_logits_level.permute(1, 2, 0).reshape(-1)  # (H*W)
+                points_level = points_level.reshape(-1, 2)  # (H*W) x 2
+                
+                # Apply sigmoid to get scores
+                cls_scores = torch.sigmoid(cls_logits_level)  # (H*W) x C
+                ctr_scores = torch.sigmoid(ctr_logits_level)  # (H*W)
+                
+                # Combine classification and center-ness scores
+                # Expand center-ness scores to match classification scores shape
+                ctr_scores = ctr_scores.unsqueeze(1).expand(-1, num_classes)  # (H*W) x C
+                scores = cls_scores * ctr_scores  # (H*W) x C
+                
+                # Get maximum score and corresponding class for each location
+                max_scores, _ = scores.max(dim=1)  # (H*W)
+                
+                # Filter locations based on score threshold
+                keep_idxs = max_scores > self.score_thresh
+                
+                if keep_idxs.sum() == 0:
+                    continue
+                
+                # Filter tensors
+                scores = scores[keep_idxs]  # N' x C
+                reg_outputs_level = reg_outputs_level[keep_idxs]  # N' x 4
+                points_level = points_level[keep_idxs]  # N' x 2
+                
+                # Get top-k candidates per class
+                num_points = scores.shape[0]
+                
+                for class_idx in range(num_classes):
+                    class_scores = scores[:, class_idx]  # N'
+                    
+                    # Select top-k candidates for this class
+                    num_topk = min(self.topk_candidates, num_points)
+                    topk_scores, topk_idxs = class_scores.topk(num_topk)
+                    
+                    # Filter out low scores
+                    keep = topk_scores > self.score_thresh
+                    topk_idxs = topk_idxs[keep]
+                    topk_scores = topk_scores[keep]
+                    
+                    if len(topk_idxs) == 0:
+                        continue
+                    
+                    # Get corresponding regression outputs and points
+                    topk_reg_outputs = reg_outputs_level[topk_idxs]  # K x 4
+                    topk_points = points_level[topk_idxs]  # K x 2
+                    
+                    # Decode boxes
+                    # Regression outputs are (left, top, right, bottom) distances
+                    # Multiply by stride as they were divided by stride during training
+                    topk_reg_outputs = topk_reg_outputs * stride_level
+                    
+                    # Convert distances to box coordinates
+                    point_y = topk_points[:, 0]
+                    point_x = topk_points[:, 1]
+
+                    x1 = point_x - topk_reg_outputs[:, 0]  # x - left
+                    y1 = point_y - topk_reg_outputs[:, 1]  # y - top
+                    x2 = point_x + topk_reg_outputs[:, 2]  # x + right
+                    y2 = point_y + topk_reg_outputs[:, 3]  # y + bottom
+                    
+                    boxes = torch.stack([x1, y1, x2, y2], dim=1)  # K x 4
+                    
+                    # Clip boxes to image boundaries
+                    boxes[:, 0::2] = boxes[:, 0::2].clamp(min=0, max=img_shape[1])  # x coordinates
+                    boxes[:, 1::2] = boxes[:, 1::2].clamp(min=0, max=img_shape[0])  # y coordinates
+                    
+                    # Remove small boxes
+                    keep = (boxes[:, 2] - boxes[:, 0] > 1) & (boxes[:, 3] - boxes[:, 1] > 1)
+                    boxes = boxes[keep]
+                    topk_scores = topk_scores[keep]
+                    
+                    if len(boxes) == 0:
+                        continue
+                    
+                    # Store boxes, scores, and labels
+                    img_boxes.append(boxes)
+                    img_scores.append(topk_scores)
+                    # Add 1 to labels to compensate for background class (label 0 is background)
+                    img_labels.append(torch.full_like(topk_scores, class_idx + 1, dtype=torch.int64))
+            
+            # Concatenate all boxes across pyramid levels
+            if len(img_boxes) > 0:
+                img_boxes = torch.cat(img_boxes, dim=0)  # M x 4
+                img_scores = torch.cat(img_scores, dim=0)  # M
+                img_labels = torch.cat(img_labels, dim=0)  # M
+                
+                # Apply NMS per class
+                keep = batched_nms(img_boxes, img_scores, img_labels, self.nms_thresh)
+                
+                # Keep only top detections_per_img boxes
+                keep = keep[:self.detections_per_img]
+                
+                img_boxes = img_boxes[keep]
+                img_scores = img_scores[keep]
+                img_labels = img_labels[keep]
+            else:
+                # No detections for this image
+                img_boxes = torch.zeros((0, 4))
+                img_scores = torch.zeros((0,))
+                img_labels = torch.zeros((0,), dtype=torch.int64)
+            
+            # Store results for this image
+            detections.append({
+                "boxes": img_boxes,
+                "scores": img_scores,
+                "labels": img_labels
+            })
+        
         return detections
