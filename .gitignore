@@ -5,7 +5,9 @@ hw2/logs
 __pycache__/
 .ipynb_checkpoints
 .DS_Store
+
 hw3/data/VOCdevkit
 hw3/logs
 hw3/data/VOCtrainval_06-Nov-2007.tar
 hw3/data/VOCtest_06-Nov-2007.tar
+hw3/data/coco/

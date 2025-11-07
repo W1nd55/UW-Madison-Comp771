@@ -71,14 +71,120 @@ class VOCDetection(torchvision.datasets.CocoDetection):
         return img, target
 
 
+class COCODetection(torchvision.datasets.CocoDetection):
+    """
+    A simple dataset wrapper to load COCO data
+    """
+
+    def __init__(self, img_folder, ann_file, transforms):
+        super().__init__(img_folder, ann_file)
+        self._transforms = transforms
+
+    def get_cls_names(self):
+        cls_names = (
+            "person",
+            "bicycle",
+            "car",
+            "motorcycle",
+            "airplane",
+            "bus",
+            "train",
+            "truck",
+            "boat",
+            "traffic light",
+            "fire hydrant",
+            "stop sign",
+            "parking meter",
+            "bench",
+            "bird",
+            "cat",
+            "dog",
+            "horse",
+            "sheep",
+            "cow",
+            "elephant",
+            "bear",
+            "zebra",
+            "giraffe",
+            "backpack",
+            "umbrella",
+            "handbag",
+            "tie",
+            "suitcase",
+            "frisbee",
+            "skis",
+            "snowboard",
+            "sports ball",
+            "kite",
+            "baseball bat",
+            "baseball glove",
+            "skateboard",
+            "surfboard",
+            "tennis racket",
+            "bottle",
+            "wine glass",
+            "cup",
+            "fork",
+            "knife",
+            "spoon",
+            "bowl",
+            "banana",
+            "apple",
+            "sandwich",
+            "orange",
+            "broccoli",
+            "carrot",
+            "hot dog",
+            "pizza",
+            "donut",
+            "cake",
+            "chair",
+            "couch",
+            "potted plant",
+            "bed",
+            "dining table",
+            "toilet",
+            "tv",
+            "laptop",
+            "mouse",
+            "remote",
+            "keyboard",
+            "cell phone",
+            "microwave",
+            "oven",
+            "toaster",
+            "sink",
+            "refrigerator",
+            "book",
+            "clock",
+            "vase",
+            "scissors",
+            "teddy bear",
+            "hair drier",
+            "toothbrush",
+        )
+        return cls_names
+
+    def __getitem__(self, idx):
+        img, target = super().__getitem__(idx)
+        image_id = self.ids[idx]
+        target = dict(image_id=image_id, annotations=target)
+        if self._transforms is not None:
+            img, target = self._transforms(img, target)
+        return img, target
+
+
 def build_dataset(name, split, img_folder, json_folder):
     """
-    Create VOC dataset with default transforms for training / inference.
+    Create VOC or COCO dataset with default transforms for training / inference.
     New datasets can be linked here.
     """
     if name == "VOC2007":
         assert split in ["trainval", "test"]
         is_training = split == "trainval"
+    elif name == "COCO":
+        assert split in ["train2017", "val2017", "test2017"]
+        is_training = split == "train2017"
     else:
         print("Unsupported dataset")
         return None
@@ -92,12 +198,18 @@ def build_dataset(name, split, img_folder, json_folder):
         dataset = VOCDetection(
             img_folder, os.path.join(json_folder, split + ".json"), transforms
         )
+    elif name == "COCO":
+        # COCO images are in subdirectories (train2017/, val2017/, test2017/)
+        # Annotation files are named instances_{split}.json
+        split_img_folder = os.path.join(img_folder, split)
+        ann_file = os.path.join(json_folder, f"instances_{split}.json")
+        dataset = COCODetection(split_img_folder, ann_file, transforms)
     return dataset
 
 
 def build_dataloader(dataset, is_training, batch_size, num_workers):
     """
-    Create a dataloder for VOC dataset
+    Create a dataloder for VOC or COCO dataset
     """
     loader = torch.utils.data.DataLoader(
         dataset,
