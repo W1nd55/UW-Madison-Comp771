@@ -52,11 +52,15 @@ def train_one_epoch(
         else:
             # forward / backward the model
             losses = model(imgs, targets)
-            losses["final_loss"].backward()
-            # step optimizer / scheduler
-            optimizer.step()
-            scheduler.step()
+            if torch.isfinite(losses["final_loss"]):
+                losses["final_loss"].backward()
+                # step optimizer / scheduler
+                optimizer.step()
+                scheduler.step()
 
+            else:
+                print(f"Skipping update at idx {iter_idx} due to non-finite loss")
+            
         # printing (only check the stats when necessary to avoid extra cost)
         if (iter_idx != 0) and (iter_idx % print_freq) == 0:
             # measure elapsed time (sync all kernels)
@@ -161,7 +165,7 @@ def evaluate(
                         "image_id": image_id,
                         "category_id": int(label),
                         "bbox": box,
-                        "score": score,
+                        "score": score
                     }
                 )
 

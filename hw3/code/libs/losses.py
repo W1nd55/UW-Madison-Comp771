@@ -106,5 +106,6 @@ def sigmoid_focal_loss(
         loss = loss.mean()
     elif reduction == "sum":
         loss = loss.sum()
-
+    if not torch.isfinite(loss).all():
+        print("sigmoid_focal_loss loss is not finite!")
     return loss
