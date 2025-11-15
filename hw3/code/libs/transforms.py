@@ -59,6 +59,12 @@ class ConvertAnnotations:
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         classes = classes[keep]
+        
+        # Filter out invalid class indices (COCO has 91 categories but only 80 used for detection)
+        # Ensure class indices are in valid range [0, num_classes-1]
+        valid_classes = (classes >= 0) & (classes < 80)
+        boxes = boxes[valid_classes]
+        classes = classes[valid_classes]
 
         target = {}
         target["boxes"] = boxes
