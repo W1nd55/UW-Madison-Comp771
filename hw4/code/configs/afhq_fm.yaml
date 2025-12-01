@@ -1,0 +1,18 @@
+output_folder: "../logs"
+model_type: "FM"
+dataset:
+  name: "AFHQ"
+  data_folder: "../data/afhq/train"
+model:
+  dim: 96
+  context_dim: 96
+  use_vae: True
+  vae_encoder_weights: "../pretrained/taesd_encoder.pth"
+  vae_decoder_weights: "../pretrained/taesd_decoder.pth"
+  timesteps: 10
+train_cfg:
+  epochs: 300
+  lr: 0.0002
+test_cfg:
+  test_data_folder: "../data/afhq/test"
+  num_eval_samples: 500

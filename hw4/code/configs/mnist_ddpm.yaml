@@ -1,0 +1,7 @@
+output_folder: "../logs"
+model_type: "DDPM"
+dataset:
+  name: "MNIST"
+  data_folder: "../data"
+model:
+  timesteps: 500
