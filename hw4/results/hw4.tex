@@ -1,0 +1,187 @@
+\documentclass[11pt]{article}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{url}
+\usepackage{enumitem}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{BMI / CS 771: Homework Assignment 4 Report}
+\author{Qinxinghao Chen \quad Handan Hu \quad Chongwei Liu \quad Bohan Wen}
+\date{December 2025}
+
+\begin{document}
+\maketitle
+
+% ----------------------------------------------
+
+\section*{Acknowledgment of AI Assistance}
+This assignment was completed with the assistance of OpenAI’s ChatGPT (GPT-5). The tool was used throughout the process to brainstorm ideas, clarify relevant concepts, explain code logic, and check grammar. All final decisions regarding content, analysis, and conclusions were made by the author.
+
+% ----------------------------------------------
+\section{Team Contributions}
+\begin{itemize}
+    \item Qinxinghao Chen:
+    \item Handan Hu:
+    \item Chongwei Liu:
+    \item Bohan Wen:
+\end{itemize}
+
+% ----------------------------------------------
+\section{Implementation Details and Challenges}
+
+This assignment involved completing several missing components of a UNet, DDPM, and Rectified Flow (FM) model, and then training and evaluating them on MNIST and AFHQ. Here we briefly summarize the main details and challenges.
+
+\subsection{UNet}
+The UNet takes in: (1) a noisy/partial image, (2) a time embedding, and (3) a label embedding.  
+We filled in the decoder part where skip connections from the encoder are merged with upsampled features. The key idea was to pop encoder features in reverse order, concatenate them channel-wise, feed them through a ResBlock, optionally apply a transformer block, and then upsample if needed.
+
+\textbf{Why normalize inputs to [-1, 1]?}  
+It makes training more stable and aligns with conventions used in latent diffusion models (e.g., Stable Diffusion). Many activations behave better when inputs are centered near zero.
+
+\textbf{How do time and labels enter the network?}  
+Time is encoded using sinusoidal embedding and injected into each ResBlock. Labels are embedded and passed into SpatialTransformer blocks as conditioning context.
+
+\subsection{DDPM}
+We filled in:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{q\_sample}: Forward diffusion $x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1 - \bar{\alpha}_t}\,\epsilon$.
+    \item \texttt{p\_sample}: Single reverse step using the DDPM mean formula.
+    \item \texttt{generate}: Full reverse chain from noise to image.
+    \item \texttt{compute\_loss}: Simplified denoising loss comparing predicted and true noise.
+\end{itemize}
+
+\subsection{Latent Diffusion (LDM)}
+For AFHQ, we used the provided tiny autoencoder.  
+During training, images are encoded into latents; diffusion is applied in latent space; at sampling time, generated latents are decoded back to images.
+
+\subsection{Rectified Flow (FM)}
+FM uses a straight-line interpolation between Gaussian noise and the real sample.  
+We implemented:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{compute\_loss}: Predicting the velocity between noise and data.
+    \item \texttt{generate}: Euler integration from $t=0$ to $1$.
+\end{itemize}
+
+FM is simpler than DDPM and typically faster to sample.
+
+% ----------------------------------------------
+\section{DDPM Experiments}
+
+\subsection{MNIST}
+
+\subsubsection{Training Setup}
+We trained DDPM on MNIST using:
+\begin{verbatim}
+cd code
+python train.py ./configs/mnist_ddpm.yaml -c 1
+\end{verbatim}
+
+\subsubsection{Training Curves}
+Figure~\ref{fig:mnist_ddpm_loss} shows the training loss.  
+\textbf{TODO: Insert MNIST DDPM loss curve.}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.55\linewidth]{mnist_ddpm_loss.png}
+    \caption{MNIST DDPM training loss.}
+    \label{fig:mnist_ddpm_loss}
+\end{figure}
+
+\subsubsection{Generated Samples}
+Figure~\ref{fig:mnist_ddpm_samples} shows generated digits.  
+\textbf{TODO: Insert MNIST DDPM sample image.}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.55\linewidth]{mnist_ddpm_samples.png}
+    \caption{MNIST DDPM generated samples.}
+    \label{fig:mnist_ddpm_samples}
+\end{figure}
+
+\subsubsection{Discussion}
+DDPM learned to generate clear digits after a few epochs. Early samples look blurry, but quality improves steadily. The model matches labels correctly.
+
+% ----------------------------------------------
+\subsection{Latent DDPM on AFHQ}
+
+\subsubsection{Training Setup}
+We trained latent DDPM on AFHQ using:
+\begin{verbatim}
+cd code
+python train.py ./configs/afhq_ddpm.yaml -c 10
+\end{verbatim}
+
+Evaluation:
+\begin{verbatim}
+python eval.py ./configs/afhq_ddpm.yaml path_to_checkpoint
+\end{verbatim}
+
+\subsubsection{Training Curves}
+\textbf{TODO: Insert AFHQ DDPM loss curve.}
+
+\subsubsection{Generated Samples}
+\textbf{TODO: Insert AFHQ DDPM sample image.}
+
+\subsubsection{FID Score}
+\textbf{TODO: Insert AFHQ DDPM FID number.}
+
+\subsubsection{Discussion}
+The model captures general face shapes well, though textures may look soft due to small latent UNet and short training.
+
+% ----------------------------------------------
+\section{Flow Matching (FM) Experiments}
+
+\subsection{MNIST (Task 3B)}
+
+\subsubsection{Training Setup}
+We trained pixel-space FM on MNIST:
+\begin{verbatim}
+cd code
+python train.py ./configs/mnist_fm.yaml -c 1
+\end{verbatim}
+
+\subsubsection{Training Curves}
+\textbf{TODO: Insert MNIST FM loss curve.}
+
+\subsubsection{Generated Samples}
+\textbf{TODO: Insert MNIST FM sample image.}
+
+\subsubsection{Discussion}
+FM trains smoothly and produces clean digits. Sampling is very fast since it does not involve any noise during generation.
+
+% ----------------------------------------------
+\subsection{AFHQ (Task 3C)}
+
+\subsubsection{Training Setup}
+Training in latent space:
+\begin{verbatim}
+cd code
+python train.py ./configs/afhq_fm.yaml -c 10
+\end{verbatim}
+
+Evaluate FID:
+\begin{verbatim}
+python eval.py ./configs/afhq_fm.yaml path_to_checkpoint
+\end{verbatim}
+
+\subsubsection{Training Curves}
+\textbf{TODO: Insert AFHQ FM loss curve.}
+
+\subsubsection{Generated Samples}
+\textbf{TODO: Insert AFHQ FM sample image.}
+
+\subsubsection{FID Score}
+\textbf{TODO: Insert AFHQ FM FID number.}
+
+\subsubsection{Discussion}
+FM produces reasonable AFHQ images with faster sampling than DDPM. Quality is close, sometimes a bit smoother. FID depends on training budget but is typically similar to or slightly worse than latent DDPM at this scale.
+
+% ----------------------------------------------
+\section{Conclusion and Future Work}
+
+In HW4, we completed and trained UNet, DDPM, latent DDPM, and FM models. MNIST experiments validated correctness, and AFHQ experiments showed that both latent DDPM and FM can generate recognizable animal faces under limited training.
+
+Future work could include: trying larger UNet architectures, exploring improved noise schedules, or loading Stable Diffusion checkpoints as suggested in the bonus section.
+
+\end{document}

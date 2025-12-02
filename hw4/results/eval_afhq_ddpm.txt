@@ -1,0 +1,33 @@
+{'dataset': {'data_folder': '../data/afhq/train',
+             'name': 'AFHQ',
+             'split': 'train'},
+ 'devices': ['cuda:0'],
+ 'dtype': 'fp32',
+ 'loader': {'batch_size': 64, 'num_workers': 4},
+ 'model': {'attn_levels': (0, 1),
+           'context_dim': 96,
+           'dim': 96,
+           'dim_mults': (1, 2, 4),
+           'img_shape': [3, 128, 128],
+           'num_classes': 3,
+           'timesteps': 500,
+           'use_vae': True,
+           'vae_decoder_weights': '../pretrained/taesd_decoder.pth',
+           'vae_encoder_weights': '../pretrained/taesd_encoder.pth'},
+ 'model_type': 'DDPM',
+ 'output_folder': '../logs',
+ 'test_cfg': {'num_eval_samples': 500, 'test_data_folder': '../data/afhq/test'},
+ 'train_cfg': {'epochs': 300, 'lr': 0.0002, 'num_eval_viz_samples': 10}}
+=> loading checkpoint '../logs/afhq_ddpm_2025-12-01 22:00:36/model_final.pth.tar'
+Loading model ...
+
+Generating images ...
+100% 500/500 [51:19<00:00,  6.16s/it]
+
+Evaluating FID scores ...
+Downloading: "https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_inception-2015-12-05-6726825d.pth" to /root/.cache/torch/hub/checkpoints/pt_inception-2015-12-05-6726825d.pth
+100% 91.2M/91.2M [00:00<00:00, 170MB/s]
+Saving statistics for ../data/afhq/test
+100% 30/30 [01:26<00:00,  2.87s/it]
+100% 30/30 [01:23<00:00,  2.77s/it]
+FID:  66.64695034711116

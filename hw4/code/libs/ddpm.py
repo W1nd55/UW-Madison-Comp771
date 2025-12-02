@@ -169,6 +169,8 @@ class DDPM(nn.Module):
         """
         Fill in the missing code here. See Equation 4 in DDPM paper.
         """
+        x_t = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+        return x_t
         # x_t =
         # return x_t
 
@@ -179,7 +181,30 @@ class DDPM(nn.Module):
         Fill in the missing code here. Algorithm 1 line 3-5 in the paper.
         For latent DDPMs, an additional encoding step will be needed.
         """
-        # return loss
+        # 对于 latent DDPM：先用 VAE encoder 把图像编码到 latent 空间
+        if self.use_vae:
+            with torch.no_grad():
+                # x_start: [B, 3, H, W] -> latent: [B, 4, H/8, W/8]
+                x_start = self.vae.encoder(x_start)
+
+        # 采样噪声 ε
+        if noise is None:
+            noise = torch.randn_like(x_start)
+
+        # 从 {0,...,T-1} 均匀采样时间步 t
+        b = x_start.shape[0]
+        device = x_start.device
+        t = torch.randint(0, self.timesteps, (b,), device=device).long()
+
+        # 用前向扩散得到 x_t
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        # UNet 预测噪声 ε̂(x_t, t, y)
+        pred_noise = self.model(x_noisy, label, t)
+
+        # 简化的 DDPM loss：MSE(ε̂, ε)
+        loss = F.mse_loss(pred_noise, noise)
+        return loss
 
     @torch.no_grad()
     def p_sample(self, x, label, t, t_index):
@@ -197,7 +222,23 @@ class DDPM(nn.Module):
         Fill in the missing code here. See Equation 11 (also Algorithm 2 line 3-4)
         in DDPM paper.
         """
-        # mu =
+        # 预测噪声 ε̂(x_t, t, y)
+        eps_theta = self.model(x, label, t)
+
+        # Equation 11: μ_θ(x_t, t) = 1/√α_t [ x_t - β_t / √(1-ᾱ_t) · ε̂ ]
+        model_mean = sqrt_recip_alphas_t * (
+            x - betas_t / sqrt_one_minus_alphas_cumprod_t * eps_theta
+        )
+
+        # 当 t=0 时，不再加噪声，直接返回均值
+        if t_index == 0:
+            return model_mean
+
+        # 否则从 q(x_{t-1} | x_t, x_0) 中采样：x_{t-1} = μ + σ_t z
+        posterior_variance_t = self._extract(self.posterior_variance, t, x.shape)
+        noise = torch.randn_like(x)
+        x_prev = model_mean + torch.sqrt(posterior_variance_t) * noise
+        return x_prev
 
     @torch.no_grad()
     def generate(self, labels):
@@ -216,7 +257,20 @@ class DDPM(nn.Module):
         Fill in the missing code here. See Equation 11 / Algorithm 2 in DDPM paper.
         For latent DDPMs, an additional decoding step will be needed.
         """
-        # for ...
+        # 确保 labels 是在正确 device 上的 tensor
+        if not torch.is_tensor(labels):
+            labels = torch.tensor(labels, device=device, dtype=torch.long)
+        else:
+            labels = labels.to(device)
+
+        # Algorithm 2：从 T-1 到 0 迭代调用 p_sample
+        for i in reversed(range(self.timesteps)):
+            t = torch.full((imgs.shape[0],), i, device=device, dtype=torch.long)
+            imgs = self.p_sample(imgs, labels, t, t_index=i)
+
+        # 如果是 latent DDPM，则把 latent 解码回图像空间
+        if self.use_vae:
+            imgs = self.vae.decoder(imgs)
 
         # postprocessing the images
         imgs = self.postprocess(imgs)

@@ -227,6 +227,22 @@ class UNet(nn.Module):
         You can use the encoder part as a reference.
         """
         # decoder
+        for resblock, transformer, upsample in self.decoder:
+            # 从 encoder_output 中取出对应的 skip connection（倒序）
+            skip = encoder_output.pop()
+            # 在通道维度上拼接当前特征和 skip 特征
+            x = torch.cat([x, skip], dim=1)
+
+            # 残差块（带时间调制）
+            x = resblock(x, t)
+
+            # 可选的 transformer（带条件 c）
+            if transformer is not None:
+                x = transformer(x, c)
+
+            # 可选的上采样
+            if upsample is not None:
+                x = upsample(x)
 
         x = self.final_conv(x)
         return x
