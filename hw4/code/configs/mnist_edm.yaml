@@ -1,0 +1,15 @@
+output_folder: "../logs"
+model_type: "EDM"
+dataset:
+  name: "MNIST"
+  data_folder: "../data"
+model:
+  # EDM-specific parameters
+  timesteps: 50  # EDM needs fewer steps
+  sigma_min: 0.002
+  sigma_max: 80.0
+  sigma_data: 0.5
+  rho: 7.0
+  P_mean: -1.2
+  P_std: 1.2
+
