@@ -119,15 +119,19 @@ class CrossAttention(nn.Module):
             context = x
             
         B, N, C = x.shape
+        _, S, _ = context.shape  # S = context sequence length
         
         q = self.to_q(x)
         k = self.to_k(context)
         v = self.to_v(context)
         
-        # Reshape for multi-head attention
-        q = q.view(B, N, self.heads, -1).transpose(1, 2)
-        k = k.view(B, -1, self.heads, -1).transpose(1, 2)
-        v = v.view(B, -1, self.heads, -1).transpose(1, 2)
+        # Compute dim_head from output size
+        dim_head = q.shape[-1] // self.heads
+        
+        # Reshape for multi-head attention: [B, seq, heads, dim_head] -> [B, heads, seq, dim_head]
+        q = q.view(B, N, self.heads, dim_head).transpose(1, 2)
+        k = k.view(B, S, self.heads, dim_head).transpose(1, 2)
+        v = v.view(B, S, self.heads, dim_head).transpose(1, 2)
         
         # Attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
