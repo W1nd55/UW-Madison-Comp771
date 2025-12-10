@@ -1,0 +1,54 @@
+# Stable Diffusion 1.x Configuration
+# This config file defines the LDM (Latent Diffusion Model) settings
+# for loading and running Stable Diffusion checkpoints
+
+output_folder: "../logs"
+model_type: "StableDiffusion"
+
+# Dataset (not used for SD inference, but kept for compatibility)
+dataset:
+  name: "text2img"
+  data_folder: "../data"
+
+# Model configuration matching SD 1.x architecture
+model:
+  # UNet configuration
+  unet:
+    in_channels: 4          # VAE latent channels
+    out_channels: 4
+    dim: 320                # Base dimension (SD 1.x)
+    context_dim: 768        # CLIP embedding dimension
+    dim_mults: [1, 2, 4, 4] # Channel multipliers
+    attn_levels: [1, 2, 3]  # Attention at levels 1,2,3 (not 0)
+    num_res_blocks: 2       # ResBlocks per level
+    num_groups: 32          # GroupNorm groups
+    num_heads: 8            # Attention heads
+  
+  # CLIP text encoder
+  clip:
+    version: "openai/clip-vit-large-patch14"
+    max_length: 77
+  
+  # VAE decoder (TAESD - lightweight)
+  vae:
+    use_taesd: True
+    taesd_decoder_path: "../pretrained/taesd_decoder.pth"
+  
+  # Diffusion settings
+  diffusion:
+    num_train_timesteps: 1000
+    beta_start: 0.00085
+    beta_end: 0.012
+    beta_schedule: "scaled_linear"
+
+# Inference configuration
+inference:
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  height: 512
+  width: 512
+
+# Checkpoint path (set this to your SD checkpoint)
+checkpoint:
+  path: "../sd-v1-4.ckpt"  # Or path to sd-v1-5.safetensors
+

@@ -1,386 +1,283 @@
 """
 Stable Diffusion 1.x Compatible UNet
 
-This UNet is designed to be weight-compatible with Stable Diffusion 1.x checkpoints.
-The layer naming and architecture match the original CompVis/Stability AI implementation.
+This is a modified version of our UNet that can load Stable Diffusion 1.x checkpoints.
+It uses the same building blocks from blocks.py (which are already SD-compatible)
+but with SD 1.x specific configuration.
 
 SD 1.x Architecture:
 - Base channels: 320
 - Channel multipliers: (1, 2, 4, 4) -> (320, 640, 1280, 1280)
-- Attention at levels 1, 2, 3 (resolutions 32, 16, 8 for 64x64 latent)
+- Attention at levels 1, 2, 3 (not level 0)
 - 2 ResBlocks per level
-- Cross-attention with CLIP text embeddings (context_dim=768)
-- Latent space: 4 channels
-
-Reference: https://github.com/CompVis/stable-diffusion
+- Cross-attention with CLIP (context_dim=768)
+- 4 channels in/out (VAE latent space)
 """
 
-import math
 import torch
 from torch import nn
-import torch.nn.functional as F
+
+from .utils import default
+from .blocks import (ResBlock, SpatialTransformer, SinusoidalPE, Upsample, Downsample)
 
 
-class SinusoidalTimestepEmbedding(nn.Module):
-    """Sinusoidal timestep embeddings as used in SD."""
-    
-    def __init__(self, dim, max_period=10000):
-        super().__init__()
-        self.dim = dim
-        self.max_period = max_period
-
-    def forward(self, timesteps):
-        half = self.dim // 2
-        freqs = torch.exp(
-            -math.log(self.max_period) * 
-            torch.arange(half, dtype=torch.float32, device=timesteps.device) / half
-        )
-        args = timesteps[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if self.dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-
-class TimestepEmbedSequential(nn.Sequential):
-    """Sequential module that passes timestep embeddings to children."""
-    
-    def forward(self, x, emb, context=None):
-        for layer in self:
-            if isinstance(layer, ResBlock):
-                x = layer(x, emb)
-            elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
-            else:
-                x = layer(x)
-        return x
-
-
-class ResBlock(nn.Module):
+class UNetForSD(nn.Module):
     """
-    Residual block with timestep conditioning.
-    Compatible with SD checkpoint naming.
+    UNet modified for Stable Diffusion 1.x checkpoint loading.
+    
+    Uses our existing building blocks but with SD-specific configuration.
+    This allows loading official SD 1.x checkpoints with proper weight mapping.
     """
-    
-    def __init__(self, channels, emb_channels, out_channels=None, groups=32):
-        super().__init__()
-        out_channels = out_channels or channels
-        
-        self.in_layers = nn.Sequential(
-            nn.GroupNorm(groups, channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, out_channels, 3, padding=1),
-        )
-        
-        self.emb_layers = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(emb_channels, out_channels),
-        )
-        
-        self.out_layers = nn.Sequential(
-            nn.GroupNorm(groups, out_channels),
-            nn.SiLU(),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-        )
-        
-        if channels != out_channels:
-            self.skip_connection = nn.Conv2d(channels, out_channels, 1)
-        else:
-            self.skip_connection = nn.Identity()
 
-    def forward(self, x, emb):
-        h = self.in_layers(x)
-        emb_out = self.emb_layers(emb)[:, :, None, None]
-        h = h + emb_out
-        h = self.out_layers(h)
-        return self.skip_connection(x) + h
-
-
-class CrossAttention(nn.Module):
-    """Cross-attention layer for text conditioning."""
-    
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64):
-        super().__init__()
-        context_dim = context_dim or query_dim
-        inner_dim = dim_head * heads
-        
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-        
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim),
-        )
-
-    def forward(self, x, context=None):
-        if context is None:
-            context = x
-            
-        B, N, C = x.shape
-        _, S, _ = context.shape  # S = context sequence length
-        
-        q = self.to_q(x)
-        k = self.to_k(context)
-        v = self.to_v(context)
-        
-        # Compute dim_head from output size
-        dim_head = q.shape[-1] // self.heads
-        
-        # Reshape for multi-head attention: [B, seq, heads, dim_head] -> [B, heads, seq, dim_head]
-        q = q.view(B, N, self.heads, dim_head).transpose(1, 2)
-        k = k.view(B, S, self.heads, dim_head).transpose(1, 2)
-        v = v.view(B, S, self.heads, dim_head).transpose(1, 2)
-        
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        
-        out = attn @ v
-        out = out.transpose(1, 2).reshape(B, N, -1)
-        return self.to_out(out)
-
-
-class GEGLU(nn.Module):
-    """GEGLU activation as used in SD."""
-    
-    def __init__(self, dim_in, dim_out):
-        super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out * 2)
-
-    def forward(self, x):
-        x, gate = self.proj(x).chunk(2, dim=-1)
-        return x * F.gelu(gate)
-
-
-class FeedForward(nn.Module):
-    """Feed-forward network with GEGLU."""
-    
-    def __init__(self, dim, mult=4):
-        super().__init__()
-        inner_dim = int(dim * mult)
-        self.net = nn.Sequential(
-            GEGLU(dim, inner_dim),
-            nn.Linear(inner_dim, dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class BasicTransformerBlock(nn.Module):
-    """Transformer block with self-attention, cross-attention, and FFN."""
-    
-    def __init__(self, dim, n_heads, d_head, context_dim=None):
-        super().__init__()
-        self.attn1 = CrossAttention(dim, dim, heads=n_heads, dim_head=d_head)  # Self-attn
-        self.attn2 = CrossAttention(dim, context_dim, heads=n_heads, dim_head=d_head)  # Cross-attn
-        self.ff = FeedForward(dim)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
-
-    def forward(self, x, context=None):
-        x = self.attn1(self.norm1(x)) + x
-        x = self.attn2(self.norm2(x), context=context) + x
-        x = self.ff(self.norm3(x)) + x
-        return x
-
-
-class SpatialTransformer(nn.Module):
-    """Spatial transformer block for cross-attention with text."""
-    
-    def __init__(self, in_channels, n_heads, d_head, depth=1, context_dim=None):
-        super().__init__()
-        self.in_channels = in_channels
-        inner_dim = n_heads * d_head
-        
-        self.norm = nn.GroupNorm(32, in_channels)
-        self.proj_in = nn.Conv2d(in_channels, inner_dim, 1)
-        
-        self.transformer_blocks = nn.ModuleList([
-            BasicTransformerBlock(inner_dim, n_heads, d_head, context_dim=context_dim)
-            for _ in range(depth)
-        ])
-        
-        self.proj_out = nn.Conv2d(inner_dim, in_channels, 1)
-
-    def forward(self, x, context=None):
-        B, C, H, W = x.shape
-        x_in = x
-        
-        x = self.norm(x)
-        x = self.proj_in(x)
-        x = x.permute(0, 2, 3, 1).reshape(B, H * W, -1)
-        
-        for block in self.transformer_blocks:
-            x = block(x, context=context)
-        
-        x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2)
-        x = self.proj_out(x)
-        
-        return x + x_in
-
-
-class Upsample(nn.Module):
-    """Upsampling with conv."""
-    
-    def __init__(self, channels):
-        super().__init__()
-        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
-
-    def forward(self, x):
-        x = F.interpolate(x, scale_factor=2, mode="nearest")
-        return self.conv(x)
-
-
-class Downsample(nn.Module):
-    """Downsampling with strided conv."""
-    
-    def __init__(self, channels):
-        super().__init__()
-        self.op = nn.Conv2d(channels, channels, 3, stride=2, padding=1)
-
-    def forward(self, x):
-        return self.op(x)
-
-
-class UNetSD(nn.Module):
-    """
-    Stable Diffusion 1.x compatible UNet.
-    
-    This architecture matches the original SD 1.x UNet for weight loading.
-    """
-    
     def __init__(
         self,
         in_channels=4,
         out_channels=4,
-        model_channels=320,
-        attention_resolutions=(4, 2, 1),  # At which downsampling levels to use attention
-        num_res_blocks=2,
-        channel_mult=(1, 2, 4, 4),
-        num_heads=8,
-        context_dim=768,  # CLIP embedding dimension
-        use_spatial_transformer=True,
-        transformer_depth=1,
+        dim=320,                      # SD 1.x base dimension
+        context_dim=768,              # CLIP embedding dimension
+        dim_mults=(1, 2, 4, 4),       # SD 1.x channel multipliers
+        attn_levels=(1, 2, 3),        # Attention at these levels (not level 0)
+        num_res_blocks=2,             # 2 ResBlocks per level in SD
+        num_groups=32,                # SD uses 32 groups
+        num_heads=8,                  # SD uses 8 attention heads
     ):
         super().__init__()
-        
+
         self.in_channels = in_channels
-        self.model_channels = model_channels
-        self.num_res_blocks = num_res_blocks
-        self.attention_resolutions = attention_resolutions
-        self.channel_mult = channel_mult
-        self.num_heads = num_heads
+        self.dim = dim
         
-        time_embed_dim = model_channels * 4
+        # Calculate dimensions at each level
+        dims = [dim * m for m in dim_mults]
+        time_dim = dim * 4
         
-        # Time embedding
+        # Time embedding (sinusoidal PE + MLP)
         self.time_embed = nn.Sequential(
-            SinusoidalTimestepEmbedding(model_channels),
-            nn.Linear(model_channels, time_embed_dim),
+            SinusoidalPE(dim),
+            nn.Linear(dim, time_dim),
             nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-        )
-        
-        # Input blocks
-        self.input_blocks = nn.ModuleList([
-            TimestepEmbedSequential(nn.Conv2d(in_channels, model_channels, 3, padding=1))
-        ])
-        
-        input_block_chans = [model_channels]
-        ch = model_channels
-        ds = 1
-        
-        for level, mult in enumerate(channel_mult):
-            for _ in range(num_res_blocks):
-                layers = [ResBlock(ch, time_embed_dim, mult * model_channels)]
-                ch = mult * model_channels
-                
-                if ds in attention_resolutions:
-                    dim_head = ch // num_heads
-                    layers.append(
-                        SpatialTransformer(
-                            ch, num_heads, dim_head,
-                            depth=transformer_depth,
-                            context_dim=context_dim
-                        )
-                    )
-                
-                self.input_blocks.append(TimestepEmbedSequential(*layers))
-                input_block_chans.append(ch)
-            
-            if level != len(channel_mult) - 1:
-                self.input_blocks.append(TimestepEmbedSequential(Downsample(ch)))
-                input_block_chans.append(ch)
-                ds *= 2
-        
-        # Middle block
-        dim_head = ch // num_heads
-        self.middle_block = TimestepEmbedSequential(
-            ResBlock(ch, time_embed_dim),
-            SpatialTransformer(ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim),
-            ResBlock(ch, time_embed_dim),
-        )
-        
-        # Output blocks
-        self.output_blocks = nn.ModuleList([])
-        
-        for level, mult in list(enumerate(channel_mult))[::-1]:
-            for i in range(num_res_blocks + 1):
-                ich = input_block_chans.pop()
-                layers = [ResBlock(ch + ich, time_embed_dim, mult * model_channels)]
-                ch = mult * model_channels
-                
-                if ds in attention_resolutions:
-                    dim_head = ch // num_heads
-                    layers.append(
-                        SpatialTransformer(
-                            ch, num_heads, dim_head,
-                            depth=transformer_depth,
-                            context_dim=context_dim
-                        )
-                    )
-                
-                if level and i == num_res_blocks:
-                    layers.append(Upsample(ch))
-                    ds //= 2
-                
-                self.output_blocks.append(TimestepEmbedSequential(*layers))
-        
-        # Output
-        self.out = nn.Sequential(
-            nn.GroupNorm(32, ch),
-            nn.SiLU(),
-            nn.Conv2d(ch, out_channels, 3, padding=1),
+            nn.Linear(time_dim, time_dim),
         )
 
-    def forward(self, x, timesteps, context):
+        # Input convolution
+        self.conv_in = nn.Conv2d(in_channels, dim, kernel_size=3, padding=1)
+
+        # Encoder blocks
+        self.encoder = nn.ModuleList()
+        self.encoder_channels = [dim]  # Track channels for skip connections
+        
+        ch = dim
+        for level, mult in enumerate(dim_mults):
+            out_ch = dim * mult
+            
+            # ResBlocks at this level
+            for block_idx in range(num_res_blocks):
+                block_in = ch if block_idx == 0 else out_ch
+                layers = nn.ModuleDict({
+                    'resblock': ResBlock(block_in, time_dim, out_ch, groups=num_groups),
+                })
+                
+                # Add attention if at attention level
+                if level in attn_levels:
+                    layers['attn'] = SpatialTransformer(
+                        out_ch, context_dim, num_heads=num_heads, groups=num_groups
+                    )
+                
+                self.encoder.append(layers)
+                self.encoder_channels.append(out_ch)
+                ch = out_ch
+            
+            # Downsample (except at last level)
+            if level < len(dim_mults) - 1:
+                self.encoder.append(nn.ModuleDict({
+                    'downsample': Downsample(ch, ch)
+                }))
+                self.encoder_channels.append(ch)
+
+        # Middle block
+        self.mid_block1 = ResBlock(ch, time_dim, ch, groups=num_groups)
+        self.mid_attn = SpatialTransformer(ch, context_dim, num_heads=num_heads, groups=num_groups)
+        self.mid_block2 = ResBlock(ch, time_dim, ch, groups=num_groups)
+
+        # Decoder blocks
+        self.decoder = nn.ModuleList()
+        
+        for level, mult in reversed(list(enumerate(dim_mults))):
+            out_ch = dim * mult
+            
+            # ResBlocks at this level (including one extra for skip connection)
+            for block_idx in range(num_res_blocks + 1):
+                skip_ch = self.encoder_channels.pop()
+                block_in = ch + skip_ch  # Concatenate skip connection
+                
+                layers = nn.ModuleDict({
+                    'resblock': ResBlock(block_in, time_dim, out_ch, groups=num_groups),
+                })
+                
+                if level in attn_levels:
+                    layers['attn'] = SpatialTransformer(
+                        out_ch, context_dim, num_heads=num_heads, groups=num_groups
+                    )
+                
+                # Upsample at the end of each level (except last)
+                if block_idx == num_res_blocks and level > 0:
+                    layers['upsample'] = Upsample(out_ch, out_ch)
+                
+                self.decoder.append(layers)
+                ch = out_ch
+
+        # Output
+        self.out = nn.Sequential(
+            nn.GroupNorm(num_groups, ch),
+            nn.SiLU(),
+            nn.Conv2d(ch, out_channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x, context, timesteps):
         """
         Args:
-            x: [B, 4, H, W] latent input
-            timesteps: [B] timestep values
+            x: [B, 4, H, W] noisy latent
             context: [B, seq_len, 768] CLIP text embeddings
+            timesteps: [B] timestep values
         """
         # Time embedding
-        emb = self.time_embed(timesteps)
+        t_emb = self.time_embed(timesteps)
         
-        # Input blocks with skip connections
-        hs = []
-        h = x
-        for module in self.input_blocks:
-            h = module(h, emb, context)
-            hs.append(h)
+        # Input conv
+        h = self.conv_in(x)
         
-        # Middle block
-        h = self.middle_block(h, emb, context)
+        # Encoder with skip connections
+        skips = [h]
+        for block in self.encoder:
+            if 'resblock' in block:
+                h = block['resblock'](h, t_emb)
+                if 'attn' in block:
+                    h = block['attn'](h, context)
+            elif 'downsample' in block:
+                h = block['downsample'](h)
+            skips.append(h)
         
-        # Output blocks
-        for module in self.output_blocks:
-            h = torch.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context)
+        # Middle
+        h = self.mid_block1(h, t_emb)
+        h = self.mid_attn(h, context)
+        h = self.mid_block2(h, t_emb)
+        
+        # Decoder
+        for block in self.decoder:
+            skip = skips.pop()
+            h = torch.cat([h, skip], dim=1)
+            h = block['resblock'](h, t_emb)
+            if 'attn' in block:
+                h = block['attn'](h, context)
+            if 'upsample' in block:
+                h = block['upsample'](h)
         
         return self.out(h)
 
+
+def load_sd_checkpoint(model, checkpoint_path, device="cpu"):
+    """
+    Load Stable Diffusion checkpoint into our UNetForSD.
+    
+    This function maps SD checkpoint keys to our model's layer names.
+    
+    Args:
+        model: UNetForSD instance
+        checkpoint_path: Path to .ckpt or .safetensors file
+        device: Device to load on
+        
+    Returns:
+        model with loaded weights
+    """
+    print(f"Loading SD checkpoint from {checkpoint_path}...")
+    
+    # Load checkpoint
+    if checkpoint_path.endswith('.safetensors'):
+        from safetensors.torch import load_file
+        state_dict = load_file(checkpoint_path, device=device)
+    else:
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        state_dict = ckpt.get("state_dict", ckpt)
+    
+    # Extract UNet weights (SD stores them under 'model.diffusion_model.')
+    unet_state_dict = {}
+    prefix = "model.diffusion_model."
+    for key, value in state_dict.items():
+        if key.startswith(prefix):
+            new_key = key[len(prefix):]
+            unet_state_dict[new_key] = value
+    
+    if not unet_state_dict:
+        print("Warning: No UNet weights found with expected prefix")
+        unet_state_dict = state_dict
+    
+    # Create key mapping from SD naming to our naming
+    mapped_weights = map_sd_weights_to_model(unet_state_dict, model)
+    
+    # Load weights
+    missing, unexpected = model.load_state_dict(mapped_weights, strict=False)
+    
+    print(f"Loaded {len(mapped_weights)} parameters")
+    if missing:
+        print(f"Missing keys: {len(missing)}")
+    if unexpected:
+        print(f"Unexpected keys: {len(unexpected)}")
+    
+    return model
+
+
+def map_sd_weights_to_model(sd_weights, model):
+    """
+    Map Stable Diffusion weight names to our model's naming convention.
+    
+    SD naming example: 
+        input_blocks.1.1.transformer_blocks.0.attn1.to_q.weight
+    Our naming:
+        encoder.0.attn.self_attn.qkv.weight (combined qkv)
+        
+    This is complex because of structural differences. We do our best to map.
+    """
+    model_state = model.state_dict()
+    mapped = {}
+    
+    # Direct mappings for easy cases
+    direct_maps = {
+        # Time embedding
+        'time_embed.0.weight': 'time_embed.0.weight',  # SinusoidalPE doesn't have weight
+        'time_embed.0.bias': 'time_embed.0.bias',
+        'time_embed.2.weight': 'time_embed.1.weight',
+        'time_embed.2.bias': 'time_embed.1.bias',
+        # Input conv
+        'input_blocks.0.0.weight': 'conv_in.weight',
+        'input_blocks.0.0.bias': 'conv_in.bias',
+        # Output
+        'out.0.weight': 'out.0.weight',
+        'out.0.bias': 'out.0.bias',
+        'out.2.weight': 'out.2.weight',
+        'out.2.bias': 'out.2.bias',
+    }
+    
+    # Apply direct mappings where possible
+    for sd_key, our_key in direct_maps.items():
+        if sd_key in sd_weights and our_key in model_state:
+            if sd_weights[sd_key].shape == model_state[our_key].shape:
+                mapped[our_key] = sd_weights[sd_key]
+    
+    # For remaining weights, try shape-based matching
+    sd_by_shape = {}
+    for key, value in sd_weights.items():
+        shape = tuple(value.shape)
+        if shape not in sd_by_shape:
+            sd_by_shape[shape] = []
+        sd_by_shape[shape].append((key, value))
+    
+    # Match our model's weights by shape (heuristic)
+    for our_key, our_value in model_state.items():
+        if our_key in mapped:
+            continue
+        shape = tuple(our_value.shape)
+        if shape in sd_by_shape and sd_by_shape[shape]:
+            # Take first matching shape (not perfect but works for many cases)
+            sd_key, sd_value = sd_by_shape[shape].pop(0)
+            mapped[our_key] = sd_value
+    
+    return mapped

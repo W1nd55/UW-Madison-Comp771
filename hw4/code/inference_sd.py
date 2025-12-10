@@ -1,41 +1,37 @@
 """
 Stable Diffusion Inference Script
 
-This script demonstrates loading and using Stable Diffusion 1.x checkpoints.
+This script demonstrates loading SD 1.x checkpoints using our implementation:
+1. Modified UNet (UNetForSD) - based on our blocks.py
+2. CLIP text encoder from HuggingFace
+3. Weight loading function for SD checkpoints
+4. TAESD decoder for latent decoding
 
 Usage:
-    python inference_sd.py --checkpoint path/to/sd-v1-4.ckpt --prompt "a photo of an astronaut"
-    
-    # Using TAESD decoder (faster, smaller)
-    python inference_sd.py --checkpoint path/to/sd-v1-4.ckpt --prompt "a cat" --use_taesd
-
-Download SD 1.4/1.5 checkpoints from:
-    - https://huggingface.co/CompVis/stable-diffusion-v-1-4-original
-    - https://huggingface.co/runwayml/stable-diffusion-v1-5
+    python inference_sd.py --checkpoint ../sd-v1-4.ckpt --prompt "a sunset"
 """
 
 import argparse
 import torch
+import yaml
 from pathlib import Path
-from PIL import Image
-import torchvision.transforms as T
 
 from libs.stable_diffusion import StableDiffusion
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stable Diffusion Inference")
+    parser = argparse.ArgumentParser(description="Stable Diffusion Inference (Our Implementation)")
     parser.add_argument(
         "--checkpoint", 
-        type=str, 
+        type=str,
         required=True,
         help="Path to SD checkpoint (.ckpt or .safetensors)"
     )
     parser.add_argument(
         "--prompt",
         type=str,
-        default="a photo of an astronaut riding a horse on the moon",
-        help="Text prompt for generation"
+        default="a beautiful sunset over mountains, highly detailed, oil painting",
+        help="Text prompt"
     )
     parser.add_argument(
         "--negative_prompt",
@@ -80,11 +76,6 @@ def parse_args():
         help="Image width"
     )
     parser.add_argument(
-        "--use_taesd",
-        action="store_true",
-        help="Use TAESD decoder instead of full VAE"
-    )
-    parser.add_argument(
         "--taesd_path",
         type=str,
         default="../pretrained/taesd_decoder.pth",
@@ -94,68 +85,66 @@ def parse_args():
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to use"
+        help="Device"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to config file (optional)"
     )
     return parser.parse_args()
-
-
-def tensor_to_pil(tensor):
-    """Convert tensor to PIL Image."""
-    if tensor.dim() == 4:
-        tensor = tensor[0]
-    tensor = tensor.cpu().clamp(0, 1)
-    tensor = (tensor * 255).byte()
-    tensor = tensor.permute(1, 2, 0).numpy()
-    return Image.fromarray(tensor)
 
 
 def main():
     args = parse_args()
     
-    print("=" * 60)
-    print("Stable Diffusion Inference")
+    print("\n" + "=" * 60)
+    print("Stable Diffusion Inference (Our Implementation)")
     print("=" * 60)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Prompt: {args.prompt}")
     print(f"Device: {args.device}")
     print("=" * 60)
     
-    # Load model
-    print("\nLoading Stable Diffusion...")
+    # Load config if provided
+    if args.config:
+        with open(args.config) as f:
+            config = yaml.safe_load(f)
+        print(f"Loaded config from {args.config}")
+    
+    # Load model using our implementation
     sd = StableDiffusion.from_pretrained(
-        args.checkpoint,
+        checkpoint_path=args.checkpoint,
         device=args.device,
-        use_taesd=args.use_taesd,
-        taesd_path=args.taesd_path if args.use_taesd else None,
+        taesd_decoder_path=args.taesd_path,
     )
     
-    # Generate
-    print(f"\nGenerating image with {args.steps} steps...")
-    with torch.no_grad():
-        images = sd.generate(
-            prompt=args.prompt,
-            negative_prompt=args.negative_prompt,
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.steps,
-            guidance_scale=args.guidance_scale,
-            seed=args.seed,
-        )
+    # Generate image
+    print(f"\nGenerating image...")
+    images = sd.generate(
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        height=args.height,
+        width=args.width,
+        num_inference_steps=args.steps,
+        guidance_scale=args.guidance_scale,
+        seed=args.seed,
+    )
     
     # Save
-    image = tensor_to_pil(images)
-    image.save(args.output)
-    print(f"\nSaved to {args.output}")
+    sd.save_image(images, args.output)
     
-    # Also display info
-    print("\nGeneration complete!")
+    print("\n" + "=" * 60)
+    print("Generation Complete!")
     print(f"  Prompt: {args.prompt}")
     print(f"  Size: {args.width}x{args.height}")
     print(f"  Steps: {args.steps}")
     print(f"  Guidance: {args.guidance_scale}")
     print(f"  Seed: {args.seed}")
+    print(f"  Output: {args.output}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
     main()
-
