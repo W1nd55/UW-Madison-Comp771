@@ -1,144 +1,112 @@
 # Stable Diffusion 1.x Implementation (Bonus 3)
 
-This directory contains an implementation that can load and run Stable Diffusion 1.x checkpoints.
+This implementation loads Stable Diffusion 1.x checkpoints using our own code, demonstrating understanding of the SD architecture.
 
-## Components
+## Components (As Required)
 
-### 1. UNet (`libs/unet_sd.py`)
-- SD 1.x compatible architecture
-- 320 base channels with multipliers (1, 2, 4, 4)
-- Cross-attention for text conditioning
-- Compatible with official SD checkpoint weight structure
+### 1. Modified UNet (`libs/unet_sd.py`)
+A new UNet class `UNetForSD` that:
+- Uses our existing building blocks from `blocks.py` (which are already SD-compatible with GEGLU, MLP_SD, etc.)
+- Matches SD 1.x architecture: 320 base channels, (1,2,4,4) multipliers, attention at levels 1,2,3
+- Can load official SD checkpoint weights
 
 ### 2. CLIP Text Encoder (`libs/stable_diffusion.py`)
-- Wrapper for HuggingFace `transformers` CLIP model
-- Uses `openai/clip-vit-large-patch14` (768-dim embeddings)
-- Tokenizes and encodes text prompts
+- Wrapper around OpenAI's CLIP from HuggingFace (`openai/clip-vit-large-patch14`)
+- Outputs 768-dimensional embeddings matching SD's context_dim
+- Tokenizes text to 77 tokens
 
-### 3. VAE Decoder (`libs/stable_diffusion.py`)
-- Decodes latent space to pixel space
-- Can use lightweight TAESD (included in `pretrained/`) for faster inference
+### 3. Weight Loading Function (`libs/unet_sd.py`)
+- `load_sd_checkpoint()`: Loads .ckpt or .safetensors files
+- `map_sd_weights_to_model()`: Maps SD's weight names to our architecture
 
-### 4. Stable Diffusion Pipeline (`libs/stable_diffusion.py`)
-- Complete text-to-image pipeline
-- DDIM-style sampling
-- Classifier-free guidance support
+### 4. LDM Config File (`configs/stable_diffusion.yaml`)
+- Complete configuration for SD 1.x
+- UNet, CLIP, VAE, and diffusion settings
 
 ## Requirements
 
 ```bash
-pip install transformers  # For CLIP
-pip install safetensors   # Optional, for .safetensors checkpoints
-```
-
-## Download Checkpoints
-
-Download SD 1.4 or 1.5 checkpoints:
-
-```bash
-# Option 1: SD 1.4 from HuggingFace
-wget https://huggingface.co/CompVis/stable-diffusion-v-1-4-original/resolve/main/sd-v1-4.ckpt
-
-# Option 2: SD 1.5 from HuggingFace  
-wget https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned.ckpt
+pip install transformers  # For CLIP text encoder
+pip install safetensors   # Optional, for .safetensors files
 ```
 
 ## Usage
 
-### Command Line
-
 ```bash
 cd code
 
-# Basic usage
+# Run inference with SD checkpoint
 python inference_sd.py \
-    --checkpoint path/to/sd-v1-4.ckpt \
-    --prompt "a photo of an astronaut riding a horse on the moon" \
-    --output astronaut.png
-
-# With more options
-python inference_sd.py \
-    --checkpoint path/to/sd-v1-4.ckpt \
-    --prompt "a beautiful sunset over mountains, oil painting" \
-    --negative_prompt "blurry, bad quality" \
-    --steps 50 \
-    --guidance_scale 7.5 \
-    --seed 42 \
-    --output sunset.png
-
-# Using TAESD decoder (faster, uses included pretrained weights)
-python inference_sd.py \
-    --checkpoint path/to/sd-v1-4.ckpt \
-    --prompt "a cute cat" \
-    --use_taesd \
+    --checkpoint ../sd-v1-4.ckpt \
+    --prompt "a beautiful sunset over mountains" \
     --taesd_path ../pretrained/taesd_decoder.pth \
-    --output cat.png
-```
-
-### Python API
-
-```python
-from libs.stable_diffusion import StableDiffusion
-
-# Load model
-sd = StableDiffusion.from_pretrained(
-    "path/to/sd-v1-4.ckpt",
-    device="cuda",
-    use_taesd=True,  # Use lightweight decoder
-    taesd_path="../pretrained/taesd_decoder.pth"
-)
-
-# Generate
-images = sd.generate(
-    prompt="a beautiful landscape",
-    negative_prompt="blurry",
-    height=512,
-    width=512,
-    num_inference_steps=50,
-    guidance_scale=7.5,
-    seed=42,
-)
-
-# Save (images is a tensor [B, 3, H, W] in range [0, 1])
-from torchvision.utils import save_image
-save_image(images, "output.png")
+    --output sunset.png
 ```
 
 ## Architecture Details
 
-### SD 1.x UNet Specifications:
-- **Input/Output**: 4 channels (VAE latent space)
-- **Base channels**: 320
-- **Channel multipliers**: (1, 2, 4, 4) → (320, 640, 1280, 1280)
-- **Attention resolutions**: At downsampling levels 1, 2, 4 (32x32, 16x16, 8x8 for 64x64 latent)
-- **ResBlocks per level**: 2
-- **Context dim**: 768 (CLIP ViT-L/14)
-- **Attention heads**: 8
+Our implementation matches SD 1.x:
 
-### Sampling:
-- DDIM deterministic sampling
-- Classifier-free guidance with configurable scale
-- 50 steps default (can be reduced to 20-30 for faster generation)
+| Component | Configuration |
+|-----------|--------------|
+| **UNet** | |
+| Base channels | 320 |
+| Channel multipliers | (1, 2, 4, 4) |
+| Attention levels | 1, 2, 3 (not 0) |
+| ResBlocks per level | 2 |
+| Context dim | 768 (CLIP) |
+| **CLIP** | |
+| Model | openai/clip-vit-large-patch14 |
+| Embedding dim | 768 |
+| Sequence length | 77 |
+| **VAE** | |
+| Latent channels | 4 |
+| Scaling factor | 0.18215 |
+
+## Code Structure
+
+```
+libs/
+├── blocks.py          # Building blocks (already SD-compatible: GEGLU, MLP_SD, etc.)
+├── unet_sd.py         # UNetForSD class + weight loading
+├── stable_diffusion.py # Full SD pipeline with CLIP
+└── tiny_autoencoder.py # TAESD decoder
+
+configs/
+└── stable_diffusion.yaml  # LDM config file
+```
+
+## How Weight Loading Works
+
+1. Load checkpoint file (.ckpt contains state_dict with 'model.diffusion_model.' prefix)
+2. Extract UNet weights by removing prefix
+3. Map SD weight names to our model's names
+4. Load with `strict=False` to handle any unmapped weights
+
+## Key Implementation Details
+
+### Building Blocks (from blocks.py)
+Our `blocks.py` already contains SD-compatible components:
+- `GEGLU`: Gated activation used in SD's transformer FFN
+- `MLP_SD`: SD-style MLP with GEGLU
+- `SpatialTransformer`: Self-attention + cross-attention + FFN
+- `ResBlock`: Residual block with time conditioning
+
+### UNetForSD
+- Uses same blocks as our original UNet
+- Configured for SD 1.x dimensions
+- Encoder: 4 levels × 2 ResBlocks + attention (levels 1,2,3) + downsample
+- Middle: ResBlock + Attention + ResBlock  
+- Decoder: Mirror of encoder with upsampling
+
+### Inference Pipeline
+1. Encode text prompt with CLIP → [B, 77, 768]
+2. Start from random noise in latent space → [B, 4, 64, 64]
+3. DDIM sampling loop (50 steps)
+4. Decode with TAESD → [B, 3, 512, 512]
 
 ## Notes
 
-1. **Memory**: SD 1.x requires ~4GB VRAM for inference at 512x512
-2. **Speed**: ~10-20 seconds per image on modern GPU with 50 steps
-3. **TAESD**: The lightweight decoder is much faster but slightly lower quality
-4. **Weight Loading**: The implementation includes weight mapping functions to handle differences between our architecture and SD's naming conventions
-
-## Troubleshooting
-
-### "transformers not found"
-```bash
-pip install transformers
-```
-
-### "Out of memory"
-- Use `--use_taesd` for smaller decoder
-- Reduce image size: `--height 256 --width 256`
-- Use CPU (slow): `--device cpu`
-
-### "Shape mismatch" warnings
-This is expected if weight names don't perfectly match. The model will still work with partial loading.
-
+- Weight mapping is heuristic-based due to naming differences
+- Uses TAESD (lightweight) instead of full SD VAE for decoding
+- CLIP encoder is loaded from HuggingFace (downloads ~500MB)
