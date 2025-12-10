@@ -161,7 +161,8 @@ class StableDiffusion(nn.Module):
         vae_decoder = None
         if taesd_decoder_path:
             try:
-                taesd = TAESD(decoder_path=taesd_decoder_path)
+                # Pass encoder_path=None to skip loading encoder
+                taesd = TAESD(encoder_path=None, decoder_path=taesd_decoder_path)
                 vae_decoder = taesd.decoder.to(device)
                 vae_decoder.eval()
                 print(f"Loaded TAESD decoder from {taesd_decoder_path}")
