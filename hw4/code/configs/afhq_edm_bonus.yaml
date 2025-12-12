@@ -1,0 +1,37 @@
+output_folder: "../logs"
+model_type: "EDMStochastic"
+dataset:
+  name: "AFHQ"
+  data_folder: "../data/afhq/train"
+model:
+  dim: 96
+  context_dim: 96
+  use_vae: True
+  vae_encoder_weights: "../pretrained/taesd_encoder.pth"
+  vae_decoder_weights: "../pretrained/taesd_decoder.pth"
+  # EDM noise / sampling schedule tuned for AFHQ latents
+  timesteps: 60           # a few more steps than default 50
+  sigma_min: 0.002
+  sigma_max: 40.0         # narrower range helps TAESD latents
+  sigma_data: 0.5
+  rho: 7.0
+  P_mean: -1.2
+  P_std: 1.2
+  # Use the stronger UNet and stochastic sampler (Karras et al. 2022)
+  unet_type: "improved"
+  num_res_blocks: 2
+  dropout: 0.0
+  attn_depth: 2
+  use_skip_scale: True
+  attn_levels: [0, 1, 2]
+  S_churn: 40
+  S_min: 0.05
+  S_max: 50
+  S_noise: 1.003
+train_cfg:
+  epochs: 300
+  lr: 0.0002
+test_cfg:
+  test_data_folder: "../data/afhq/test"
+  num_eval_samples: 500
+
