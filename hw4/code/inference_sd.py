@@ -93,6 +93,17 @@ def parse_args():
         default=None,
         help="Path to config file (optional)"
     )
+    parser.add_argument(
+        "--use_diffusers",
+        action="store_true",
+        help="Use diffusers StableDiffusionPipeline for weight loading/inference (recommended for quality)"
+    )
+    parser.add_argument(
+        "--vae_path",
+        type=str,
+        default=None,
+        help="Optional HuggingFace VAE path (e.g., stabilityai/sd-vae-ft-mse) when using diffusers"
+    )
     return parser.parse_args()
 
 
@@ -113,27 +124,58 @@ def main():
             config = yaml.safe_load(f)
         print(f"Loaded config from {args.config}")
     
-    # Load model using our implementation
-    sd = StableDiffusion.from_pretrained(
-        checkpoint_path=args.checkpoint,
-        device=args.device,
-        taesd_decoder_path=args.taesd_path,
-    )
-    
-    # Generate image
-    print(f"\nGenerating image...")
-    images = sd.generate(
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        height=args.height,
-        width=args.width,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance_scale,
-        seed=args.seed,
-    )
-    
-    # Save
-    sd.save_image(images, args.output)
+    # Fast path: use diffusers pipeline for high fidelity if requested
+    if args.use_diffusers:
+        try:
+            from diffusers import StableDiffusionPipeline
+            import torch
+        except ImportError as e:
+            raise ImportError("Please pip install diffusers[torch] transformers safetensors to use --use_diffusers") from e
+
+        print("\nUsing diffusers StableDiffusionPipeline for inference...")
+        pipe = StableDiffusionPipeline.from_single_file(
+            args.checkpoint,
+            torch_dtype=torch.float16 if args.device.startswith("cuda") else torch.float32,
+            use_safetensors=args.checkpoint.endswith(".safetensors"),
+            vae=args.vae_path,
+        )
+        pipe = pipe.to(args.device)
+        pipe.set_progress_bar_config(disable=False)
+        g = torch.Generator(device=args.device)
+        g.manual_seed(args.seed)
+        image = pipe(
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            height=args.height,
+            width=args.width,
+            guidance_scale=args.guidance_scale,
+            num_inference_steps=args.steps,
+            generator=g,
+        ).images[0]
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        image.save(args.output)
+    else:
+        # Load model using our implementation
+        sd = StableDiffusion.from_pretrained(
+            checkpoint_path=args.checkpoint,
+            device=args.device,
+            taesd_decoder_path=args.taesd_path,
+        )
+        
+        # Generate image
+        print(f"\nGenerating image...")
+        images = sd.generate(
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            height=args.height,
+            width=args.width,
+            num_inference_steps=args.steps,
+            guidance_scale=args.guidance_scale,
+            seed=args.seed,
+        )
+        
+        # Save
+        sd.save_image(images, args.output)
     
     print("\n" + "=" * 60)
     print("Generation Complete!")
