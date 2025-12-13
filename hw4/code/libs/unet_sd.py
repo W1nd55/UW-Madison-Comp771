@@ -237,47 +237,117 @@ def map_sd_weights_to_model(sd_weights, model):
     This is complex because of structural differences. We do our best to map.
     """
     model_state = model.state_dict()
+
+    # ------------------------------------------------------------------
+    # 1) Preprocess SD weights to fuse q/k/v into our combined Linear layers.
+    #    SD stores attention as to_q, to_k, to_v (separate Linear); our
+    #    implementation uses a single qkv Linear for self-attn and a q + kv
+    #    pair for cross-attn. Fusing here reduces missing keys drastically.
+    # ------------------------------------------------------------------
+    fused = {}
+    attn_groups = {}
+    cross_groups = {}
+
+    def _prefix(key, token):
+        # split "...to_q.weight" -> "...", token="to_q"
+        return key.rsplit(token, 1)[0]
+
+    for k, v in sd_weights.items():
+        if ".attn1.to_q." in k:
+            pref = _prefix(k, "to_q.")
+            attn_groups.setdefault(pref, {})["q" if k.endswith("weight") else "q_bias"] = v
+            continue
+        if ".attn1.to_k." in k:
+            pref = _prefix(k, "to_k.")
+            attn_groups.setdefault(pref, {})["k" if k.endswith("weight") else "k_bias"] = v
+            continue
+        if ".attn1.to_v." in k:
+            pref = _prefix(k, "to_v.")
+            attn_groups.setdefault(pref, {})["v" if k.endswith("weight") else "v_bias"] = v
+            continue
+        if ".attn2.to_q." in k:
+            pref = _prefix(k, "to_q.")
+            cross_groups.setdefault(pref, {})["q" if k.endswith("weight") else "q_bias"] = v
+            continue
+        if ".attn2.to_k." in k:
+            pref = _prefix(k, "to_k.")
+            cross_groups.setdefault(pref, {})["k" if k.endswith("weight") else "k_bias"] = v
+            continue
+        if ".attn2.to_v." in k:
+            pref = _prefix(k, "to_v.")
+            cross_groups.setdefault(pref, {})["v" if k.endswith("weight") else "v_bias"] = v
+            continue
+        fused[k] = v  # keep other weights
+
+    # fuse self-attn qkv
+    for pref, parts in attn_groups.items():
+        if all(x in parts for x in ("q", "k", "v")):
+            fused[pref + "qkv.weight"] = torch.cat(
+                [parts["q"], parts["k"], parts["v"]], dim=0
+            )
+        # Biases (if present)
+        q_b = parts.get("q_bias")
+        k_b = parts.get("k_bias")
+        v_b = parts.get("v_bias")
+        if all(isinstance(b, torch.Tensor) and b.dim() == 1 for b in (q_b, k_b, v_b)):
+            fused[pref + "qkv.bias"] = torch.cat([q_b, k_b, v_b], dim=0)
+
+    # fuse cross-attn q + kv
+    for pref, parts in cross_groups.items():
+        if "q" in parts:
+            fused[pref + "q.weight"] = parts["q"]
+        if "k" in parts and "v" in parts:
+            fused[pref + "kv.weight"] = torch.cat(
+                [parts["k"], parts["v"]], dim=0
+            )
+        # bias handling (if present)
+        q_b = parts.get("q_bias")
+        k_b = parts.get("k_bias")
+        v_b = parts.get("v_bias")
+        if isinstance(q_b, torch.Tensor) and q_b.dim() == 1:
+            fused[pref + "q.bias"] = q_b
+        if isinstance(k_b, torch.Tensor) and isinstance(v_b, torch.Tensor):
+            fused[pref + "kv.bias"] = torch.cat([k_b, v_b], dim=0)
+
+    # ------------------------------------------------------------------
+    # 2) Direct mappings for a few known keys (time embed, in/out convs)
+    # ------------------------------------------------------------------
     mapped = {}
-    
-    # Direct mappings for easy cases
     direct_maps = {
         # Time embedding
-        'time_embed.0.weight': 'time_embed.0.weight',  # SinusoidalPE doesn't have weight
-        'time_embed.0.bias': 'time_embed.0.bias',
-        'time_embed.2.weight': 'time_embed.1.weight',
-        'time_embed.2.bias': 'time_embed.1.bias',
+        "time_embed.0.weight": "time_embed.0.weight",  # SinusoidalPE doesn't have weight
+        "time_embed.0.bias": "time_embed.0.bias",
+        "time_embed.2.weight": "time_embed.1.weight",
+        "time_embed.2.bias": "time_embed.1.bias",
         # Input conv
-        'input_blocks.0.0.weight': 'conv_in.weight',
-        'input_blocks.0.0.bias': 'conv_in.bias',
+        "input_blocks.0.0.weight": "conv_in.weight",
+        "input_blocks.0.0.bias": "conv_in.bias",
         # Output
-        'out.0.weight': 'out.0.weight',
-        'out.0.bias': 'out.0.bias',
-        'out.2.weight': 'out.2.weight',
-        'out.2.bias': 'out.2.bias',
+        "out.0.weight": "out.0.weight",
+        "out.0.bias": "out.0.bias",
+        "out.2.weight": "out.2.weight",
+        "out.2.bias": "out.2.bias",
     }
-    
-    # Apply direct mappings where possible
+
     for sd_key, our_key in direct_maps.items():
-        if sd_key in sd_weights and our_key in model_state:
-            if sd_weights[sd_key].shape == model_state[our_key].shape:
-                mapped[our_key] = sd_weights[sd_key]
-    
-    # For remaining weights, try shape-based matching
+        if sd_key in fused and our_key in model_state:
+            if fused[sd_key].shape == model_state[our_key].shape:
+                mapped[our_key] = fused[sd_key]
+
+    # ------------------------------------------------------------------
+    # 3) Shape-based matching fallback (heuristic but better after fusion)
+    # ------------------------------------------------------------------
     sd_by_shape = {}
-    for key, value in sd_weights.items():
+    for key, value in fused.items():
         shape = tuple(value.shape)
-        if shape not in sd_by_shape:
-            sd_by_shape[shape] = []
-        sd_by_shape[shape].append((key, value))
-    
-    # Match our model's weights by shape (heuristic)
+        sd_by_shape.setdefault(shape, []).append((key, value))
+
     for our_key, our_value in model_state.items():
         if our_key in mapped:
             continue
         shape = tuple(our_value.shape)
         if shape in sd_by_shape and sd_by_shape[shape]:
-            # Take first matching shape (not perfect but works for many cases)
             sd_key, sd_value = sd_by_shape[shape].pop(0)
             mapped[our_key] = sd_value
-    
+
     return mapped
