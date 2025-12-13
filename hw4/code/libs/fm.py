@@ -5,6 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from .unet import UNet
+from .unet_improved import ImprovedUNet
 from .tiny_autoencoder import TAESD
 
 
@@ -23,6 +24,12 @@ class FM(nn.Module):
         use_vae=False,
         vae_encoder_weights=None,
         vae_decoder_weights=None,
+        # Improved UNet options
+        unet_type="standard",  # "standard" or "improved"
+        num_res_blocks=2,
+        dropout=0.1,
+        attn_depth=1,
+        use_skip_scale=True,
     ):
         """
         Args:
@@ -60,15 +67,30 @@ class FM(nn.Module):
             self.img_shape = img_shape
 
         # the denoising model using UNet (conditioned on input label)
-        self.model = UNet(
-            dim,
-            context_dim,
-            num_classes,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            dim_mults=dim_mults,
-            attn_levels=attn_levels
-        )
+        if unet_type == "improved":
+            self.model = ImprovedUNet(
+                dim,
+                context_dim,
+                num_classes,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                dim_mults=dim_mults,
+                attn_levels=attn_levels,
+                num_res_blocks=num_res_blocks,
+                dropout=dropout,
+                attn_depth=attn_depth,
+                use_skip_scale=use_skip_scale,
+            )
+        else:
+            self.model = UNet(
+                dim,
+                context_dim,
+                num_classes,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                dim_mults=dim_mults,
+                attn_levels=attn_levels
+            )
 
         # if we should consider latent DDPM
         if use_vae:
