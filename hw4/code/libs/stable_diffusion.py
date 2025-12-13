@@ -226,11 +226,13 @@ class StableDiffusion(nn.Module):
         latent_height = height // 8
         latent_width = width // 8
         
-        # Start from random noise
+        # Start from random noise (match SD training scale)
         latents = torch.randn(
             batch_size, 4, latent_height, latent_width,
             device=self.device
         )
+        # SD training scales VAE latents by 0.18215; keep the same scale for inference
+        latents = latents * 0.18215
         
         # Get timesteps for DDIM
         step_ratio = self.num_train_timesteps // num_inference_steps
