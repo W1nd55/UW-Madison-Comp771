@@ -277,6 +277,22 @@ def map_sd_weights_to_model(sd_weights, model):
             pref = _prefix(k, "to_v.")
             cross_groups.setdefault(pref, {})["v" if k.endswith("weight") else "v_bias"] = v
             continue
+        if ".attn1.to_out.0.weight" in k:
+            pref = _prefix(k, "to_out.0.weight")
+            fused[pref + "proj.weight"] = v
+            continue
+        if ".attn1.to_out.0.bias" in k:
+            pref = _prefix(k, "to_out.0.bias")
+            fused[pref + "proj.bias"] = v
+            continue
+        if ".attn2.to_out.0.weight" in k:
+            pref = _prefix(k, "to_out.0.weight")
+            fused[pref + "proj.weight"] = v
+            continue
+        if ".attn2.to_out.0.bias" in k:
+            pref = _prefix(k, "to_out.0.bias")
+            fused[pref + "proj.bias"] = v
+            continue
         fused[k] = v  # keep other weights
 
     # fuse self-attn qkv
@@ -314,11 +330,12 @@ def map_sd_weights_to_model(sd_weights, model):
     # ------------------------------------------------------------------
     mapped = {}
     direct_maps = {
-        # Time embedding
-        "time_embed.0.weight": "time_embed.0.weight",  # SinusoidalPE doesn't have weight
-        "time_embed.0.bias": "time_embed.0.bias",
-        "time_embed.2.weight": "time_embed.1.weight",
-        "time_embed.2.bias": "time_embed.1.bias",
+        # Time embedding: SD has two Linear layers at idx 0 and 2.
+        # Our time_embed has SinusoidalPE at idx 0, so SD's 0-> ours 1, SD's 2-> ours 3.
+        "time_embed.0.weight": "time_embed.1.weight",
+        "time_embed.0.bias": "time_embed.1.bias",
+        "time_embed.2.weight": "time_embed.3.weight",
+        "time_embed.2.bias": "time_embed.3.bias",
         # Input conv
         "input_blocks.0.0.weight": "conv_in.weight",
         "input_blocks.0.0.bias": "conv_in.bias",
